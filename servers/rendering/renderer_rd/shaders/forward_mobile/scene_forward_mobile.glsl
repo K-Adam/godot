@@ -2355,6 +2355,9 @@ void main() {
 #ifdef LIGHT_CLEARCOAT_USED
 				clearcoat, clearcoat_roughness, geo_normal,
 #endif // LIGHT_CLEARCOAT_USED
+#ifdef LIGHT_ANISOTROPY_USED
+				binormal, tangent, anisotropy,
+#endif
 				diffuse_light, direct_specular_light);
 	}
 #endif // !VERTEX_LIGHTING

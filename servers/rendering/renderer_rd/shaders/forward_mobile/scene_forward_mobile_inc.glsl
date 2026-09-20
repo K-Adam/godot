@@ -361,6 +361,8 @@ layout(set = 0, binding = 18, std430) restrict readonly buffer LineLights {
 }
 line_lights;
 
+layout(set = 0, binding = 19) uniform texture3D ltc_lut_aniso;
+
 /* Set 1: Render Pass (changes per render pass) */
 
 layout(set = 1, binding = 0, std140) uniform SceneDataBlock {

@@ -2067,6 +2067,25 @@ void RenderForwardMobile::_update_render_base_uniform_set() {
 			}
 		}
 
+		{ // Lookup-table for anisotropic GGX, packed into one volume.
+			// See servers/rendering/storage/ltc/README.md for its layout.
+			if (ltc.lut_aniso_texture.is_null()) {
+				const int dimensions = LTC_ANISO_LUT_SIZE;
+				const size_t slice_size = 4 * 2 * dimensions * dimensions; // RGBA half.
+
+				Vector<Ref<Image>> slices;
+				for (int i = 0; i < LTC_ANISO_LUT_DEPTH; i++) {
+					Vector<uint8_t> slice_data;
+					slice_data.resize(slice_size);
+
+					memcpy(slice_data.ptrw(), LTC_ANISO_LUT + i * slice_size, slice_size);
+					slices.push_back(Image::create_from_data(dimensions, dimensions, false, Image::FORMAT_RGBAH, slice_data));
+				}
+
+				ltc.lut_aniso_texture = RS::get_singleton()->texture_3d_create(Image::FORMAT_RGBAH, dimensions, dimensions, LTC_ANISO_LUT_DEPTH, false, slices);
+			}
+		}
+
 		{
 			RD::Uniform u;
 			u.binding = 15;
@@ -2097,6 +2116,14 @@ void RenderForwardMobile::_update_render_base_uniform_set() {
 			u.binding = 18;
 			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 			u.append_id(RendererRD::LightStorage::get_singleton()->get_line_light_buffer());
+			uniforms.push_back(u);
+		}
+
+		{
+			RD::Uniform u;
+			u.binding = 19;
+			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+			u.append_id(RendererRD::TextureStorage::get_singleton()->texture_get_rd_texture(ltc.lut_aniso_texture));
 			uniforms.push_back(u);
 		}
 
@@ -3702,6 +3729,9 @@ RenderForwardMobile::~RenderForwardMobile() {
 	}
 	if (ltc.lut2_texture.is_valid()) {
 		RS::get_singleton()->free_rid(ltc.lut2_texture);
+	}
+	if (ltc.lut_aniso_texture.is_valid()) {
+		RS::get_singleton()->free_rid(ltc.lut_aniso_texture);
 	}
 
 	{

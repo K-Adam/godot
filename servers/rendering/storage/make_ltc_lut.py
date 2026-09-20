@@ -1,7 +1,7 @@
-def write_bytes(file, source):
+def write_bytes(file, source, skip=0):
     with open(source.path, mode="rb") as binary:
         buffer = binary.read()
-        buffer = buffer[148:]  # skip .dds header
+        buffer = buffer[skip:]
 
         file.write("0x{:02x}".format(buffer[0]))
         for byte in range(1, len(buffer)):
@@ -17,9 +17,19 @@ def run(target, source, env):
         )
         file.write("static const int LTC_LUT_DIMENSIONS = 64; // 64x64\n")
         file.write("static const uint8_t LTC_LUT1[] = {")
-        write_bytes(file, source[1])
+        write_bytes(file, source[1], 148)  # skip .dds header
         file.write("};\n\n")
 
         file.write("static const uint8_t LTC_LUT2[] = {")
-        write_bytes(file, source[2])
+        write_bytes(file, source[2], 148)  # skip .dds header
+        file.write("};\n\n")
+
+        file.write('// Anisotropic GGX LTC table from "Bringing Linearly Transformed Cosines to\n')
+        file.write('// Anisotropic GGX" by Aakash KT, Eric Heitz, Jonathan Dupuy and P. J. Narayanan\n')
+        file.write("// (I3D 2022), MIT licensed: https://github.com/AakashKT/LTC-Anisotropic\n")
+        file.write("// Repacked into one RGBA16F volume; see servers/rendering/storage/ltc/README.md.\n")
+        file.write("static const int LTC_ANISO_LUT_SIZE = 8; // 8x8 per slice\n")
+        file.write("static const int LTC_ANISO_LUT_DEPTH = 192; // 3 matrix rows of 8x8 slices\n")
+        file.write("static const uint8_t LTC_ANISO_LUT[] = {")
+        write_bytes(file, source[3])
         file.write("};\n\n")

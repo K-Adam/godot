@@ -3020,6 +3020,9 @@ void fragment_shader(in SceneData scene_data) {
 #ifdef LIGHT_CLEARCOAT_USED
 						clearcoat, clearcoat_roughness, geo_normal,
 #endif
+#ifdef LIGHT_ANISOTROPY_USED
+						binormal, tangent, anisotropy,
+#endif
 						diffuse_light, direct_specular_light);
 			}
 		}

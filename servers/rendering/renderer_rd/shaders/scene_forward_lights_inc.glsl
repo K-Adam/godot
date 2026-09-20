@@ -6,11 +6,10 @@
 
 // Uncomment to shade line lights by brute-force Gauss-Legendre quadrature of the
 // actual BRDF instead of the analytic integrals. Far slower, and only meant as a
-// ground truth to validate light_process_line() against. Anisotropic materials
-// keep using the analytic path, which ignores anisotropy until the anisotropic
-// LTC tables land. Note this path regularizes the distance to each sample rather
-// than the perpendicular distance to the line, so the two necessarily diverge
-// where a surface touches the segment.
+// ground truth to validate light_process_line() against. Note this path
+// regularizes the distance to each sample rather than the perpendicular
+// distance to the line, so the two necessarily diverge where a surface touches
+// the segment.
 //#define LINE_LIGHT_REFERENCE
 
 // This annotation macro must be placed before any loops that rely on specialization constants as their upper bound.
@@ -1339,6 +1338,9 @@ void light_process_line(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, hvec
 #ifdef LIGHT_CLEARCOAT_USED
 		half clearcoat, half clearcoat_roughness, hvec3 vertex_normal,
 #endif
+#ifdef LIGHT_ANISOTROPY_USED
+		hvec3 binormal, hvec3 tangent, half anisotropy,
+#endif
 		inout hvec3 diffuse_light, inout hvec3 specular_light) {
 	vec3 segment = line_lights.data[idx].area_width;
 	float length_sq = dot(segment, segment);
@@ -1372,7 +1374,7 @@ void light_process_line(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, hvec
 
 	hvec3 color = hvec3(line_lights.data[idx].color);
 
-#if defined(LINE_LIGHT_REFERENCE) && !defined(LIGHT_ANISOTROPY_USED)
+#ifdef LINE_LIGHT_REFERENCE
 	// 16-point Gauss-Legendre quadrature of the real BRDF along the segment.
 	// Nodes and weights are symmetric, so only the positive half is stored.
 	const float quad_nodes[8] = float[](0.0950125098, 0.2816035508, 0.4580167777, 0.6178762444, 0.7554044084, 0.8656312024, 0.9445750231, 0.9894009350);
@@ -1409,6 +1411,9 @@ void light_process_line(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, hvec
 #ifdef LIGHT_CLEARCOAT_USED
 					clearcoat, clearcoat_roughness, vertex_normal,
 #endif
+#ifdef LIGHT_ANISOTROPY_USED
+					binormal, tangent, anisotropy,
+#endif
 					diffuse_light,
 					specular_light);
 		}
@@ -1422,7 +1427,11 @@ void light_process_line(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, hvec
 	vec2 ltc_fresnel = vec2(0.0);
 	hvec3 fresnel_color = hvec3(0.0);
 #if !defined(SPECULAR_DISABLED) || (defined(LIGHT_CODE_USED) && defined(AREA_LIGHT_CODE_USED))
+#ifdef LIGHT_ANISOTROPY_USED
+	ltc_evaluate_line_specular_anisotropic(vec3(normal), vec3(tangent), vec3(binormal), vec3(eye_vec), float(roughness), float(anisotropy), p1, p2, min_radius, SAMPLER_LINEAR_CLAMP, ltc_lut2, ltc_lut_aniso, ltc_specular, ltc_fresnel);
+#else
 	ltc_evaluate_line_specular(vec3(normal), vec3(eye_vec), roughness, p1, p2, min_radius, SAMPLER_LINEAR_CLAMP, ltc_lut1, ltc_lut2, ltc_specular, ltc_fresnel);
+#endif
 	half f90 = clamp(dot(f0, hvec3(50.0 * 0.33)), metallic, half(1.0));
 	fresnel_color = f0 * max(half(ltc_fresnel.x), half(0.0)) + (f90 - f0) * max(half(ltc_fresnel.y), half(0.0));
 #endif

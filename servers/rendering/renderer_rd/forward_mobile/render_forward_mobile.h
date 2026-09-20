@@ -102,6 +102,7 @@ private:
 	struct LTC {
 		RID lut1_texture;
 		RID lut2_texture;
+		RID lut_aniso_texture;
 	} ltc;
 
 	/* Rendering */

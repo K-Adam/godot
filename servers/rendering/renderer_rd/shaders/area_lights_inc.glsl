@@ -10,14 +10,22 @@ float acos_approx(float p_x) {
 	return (p_x >= 0) ? res : M_PI - res;
 }
 
+// View elevation normalized to [0, 1], the second axis of every LTC table.
+float ltc_theta(float cos_theta) {
+	return acos_approx(cos_theta) / float(0.5 * M_PI);
+}
+
+vec2 ltc_lut_uv(float roughness, float theta) {
+	const float LTC_LUT_SIZE = float(64.0);
+	vec2 lut_pos = vec2(max(roughness, float(0.02)), theta);
+	return vec2(lut_pos * (float(63.0) / LTC_LUT_SIZE) + vec2(float(0.5) / LTC_LUT_SIZE)); // offset by 1 pixel
+}
+
 // Fetches the inverse LTC matrix that turns the clamped cosine distribution into
 // the GGX lobe for this roughness and view angle, plus the amplitude and Fresnel
 // terms in `fresnel`.
 mat3 ltc_matrix(vec3 normal, vec3 eye_vec, float roughness, sampler lut_sampler, texture2D ltc_lut1, texture2D ltc_lut2, out vec2 fresnel) {
-	float theta = acos_approx(dot(normal, eye_vec));
-	const float LTC_LUT_SIZE = float(64.0);
-	vec2 lut_pos = vec2(max(roughness, float(0.02)), theta / float(0.5 * M_PI));
-	vec2 lut_uv = vec2(lut_pos * (float(63.0) / LTC_LUT_SIZE) + vec2(float(0.5) / LTC_LUT_SIZE)); // offset by 1 pixel
+	vec2 lut_uv = ltc_lut_uv(roughness, ltc_theta(dot(normal, eye_vec)));
 	vec4 M_brdf_abcd = texture(sampler2D(ltc_lut1, lut_sampler), lut_uv);
 	vec3 M_brdf_e_mag_fres = texture(sampler2D(ltc_lut2, lut_sampler), lut_uv).xyz;
 	float scale = 1.0 / (M_brdf_abcd.x * M_brdf_e_mag_fres.x - M_brdf_abcd.y * M_brdf_abcd.w);
@@ -232,12 +240,7 @@ float line_measure(vec3 p1, vec3 p2, float min_distance) {
 // cosine, then correct for how the transform rescales the segment's width.
 // The diffuse case is M_inv == identity, where the width factor is exactly 1;
 // call line_integrate_diffuse() directly with the shading normal instead.
-float ltc_evaluate_line(vec3 normal, vec3 eye_vec, mat3 M_inv, vec3 p1, vec3 p2, float min_radius) {
-	// Orthonormal basis around the normal, matching ltc_evaluate().
-	vec3 z = -normalize(eye_vec - normal * dot(eye_vec, normal));
-	vec3 x = cross(normal, z);
-	M_inv = M_inv * transpose(mat3(x, normal, z));
-
+float ltc_evaluate_line_transformed(mat3 M_inv, vec3 p1, vec3 p2, float min_radius) {
 	vec3 l1 = M_inv * p1;
 	vec3 l2 = M_inv * p2;
 
@@ -255,10 +258,128 @@ float ltc_evaluate_line(vec3 normal, vec3 eye_vec, mat3 M_inv, vec3 p1, vec3 p2,
 	return w * line_integrate_diffuse(l1, l2, vec3(0.0, 1.0, 0.0), w * min_radius);
 }
 
+float ltc_evaluate_line(vec3 normal, vec3 eye_vec, mat3 M_inv, vec3 p1, vec3 p2, float min_radius) {
+	// Orthonormal basis around the normal, matching ltc_evaluate().
+	vec3 z = -normalize(eye_vec - normal * dot(eye_vec, normal));
+	vec3 x = cross(normal, z);
+	return ltc_evaluate_line_transformed(M_inv * transpose(mat3(x, normal, z)), p1, p2, min_radius);
+}
+
 void ltc_evaluate_line_specular(vec3 normal, vec3 eye_vec, float roughness, vec3 p1, vec3 p2, float min_radius, sampler lut_sampler, texture2D ltc_lut1, texture2D ltc_lut2, out float ltc_specular, out vec2 fresnel) {
 	mat3 M_inv = ltc_matrix(normal, eye_vec, roughness, lut_sampler, ltc_lut1, ltc_lut2, fresnel);
 	ltc_specular = ltc_evaluate_line(normal, eye_vec, M_inv, p1, p2, min_radius);
 }
+
+#ifdef LIGHT_ANISOTROPY_USED
+
+// det(m) * inverse(m), which needs no division.
+mat3 ltc_adjugate(mat3 m) {
+	return transpose(mat3(cross(m[1], m[2]), cross(m[2], m[0]), cross(m[0], m[1])));
+}
+
+// Samples the 8^4 anisotropic GGX table of "Bringing Linearly Transformed
+// Cosines to Anisotropic GGX" (Aakash KT, Heitz, Dupuy and Narayanan, I3D
+// 2022). It is stored as one 8x8x192 volume: x is the view azimuth and y its
+// elevation, while z packs the three matrix rows over 8 roughness slices of 8
+// roughness-ratio steps each. Azimuth, elevation and ratio are filtered by the
+// hardware, the roughness slices by hand.
+mat3 ltc_aniso_lut_fetch(vec4 lut_pos, sampler lut_sampler, texture3D ltc_lut_aniso) {
+	const float LUT_SIZE = float(8.0); // The table is 8^4, stored as 8 x 8 x (3 * 64).
+	const float ROW_STRIDE = LUT_SIZE * LUT_SIZE; // 8 roughness slices of 8 ratio steps.
+	const float DEPTH = float(3.0) * ROW_STRIDE;
+
+	float slice = lut_pos.w * (LUT_SIZE - float(1.0));
+	float slice_lo = floor(slice);
+	float blend = slice - slice_lo;
+	float ratio = lut_pos.z * (LUT_SIZE - float(1.0)) + float(0.5);
+	float z_lo = slice_lo * LUT_SIZE + ratio;
+	float z_hi = min(slice_lo + float(1.0), LUT_SIZE - float(1.0)) * LUT_SIZE + ratio;
+	vec2 uv = (lut_pos.xy * (LUT_SIZE - float(1.0)) + float(0.5)) / LUT_SIZE;
+
+	// Unrolled by hand: this file already carries workarounds for compilers
+	// mishandling structured code, and three iterations do not need a loop.
+	vec3 row0 = mix(texture(sampler3D(ltc_lut_aniso, lut_sampler), vec3(uv, z_lo / DEPTH)).xyz,
+			texture(sampler3D(ltc_lut_aniso, lut_sampler), vec3(uv, z_hi / DEPTH)).xyz, blend);
+	vec3 row1 = mix(texture(sampler3D(ltc_lut_aniso, lut_sampler), vec3(uv, (z_lo + ROW_STRIDE) / DEPTH)).xyz,
+			texture(sampler3D(ltc_lut_aniso, lut_sampler), vec3(uv, (z_hi + ROW_STRIDE) / DEPTH)).xyz, blend);
+	vec3 row2 = mix(texture(sampler3D(ltc_lut_aniso, lut_sampler), vec3(uv, (z_lo + float(2.0) * ROW_STRIDE) / DEPTH)).xyz,
+			texture(sampler3D(ltc_lut_aniso, lut_sampler), vec3(uv, (z_hi + float(2.0) * ROW_STRIDE) / DEPTH)).xyz, blend);
+	return transpose(mat3(row0, row1, row2));
+}
+
+// Inverse LTC matrix for anisotropic GGX, taking light vectors straight from
+// world space to the cosine space the line integral expects (clamped cosine
+// around +Y). `alpha_x` and `alpha_y` are the GGX widths along the tangent and
+// the binormal, both in (0, 1].
+mat3 ltc_matrix_anisotropic(vec3 normal, vec3 tangent, vec3 binormal, vec3 eye_vec, float theta, float alpha_x, float alpha_y, sampler lut_sampler, texture3D ltc_lut_aniso) {
+	// A non-uniform model scale leaves these unnormalized, and they are used as
+	// a frame here, not just for dot products.
+	tangent = normalize(tangent);
+	binormal = normalize(binormal);
+
+	// The table only covers alpha_x >= alpha_y; the rest is the same fit with
+	// the two tangent axes swapped.
+	bool swap_axes = alpha_y > alpha_x;
+	vec2 view_azimuth = vec2(dot(tangent, eye_vec), dot(binormal, eye_vec));
+	if (swap_axes) {
+		view_azimuth = view_azimuth.yx;
+	}
+
+	// ...and only its first quadrant, which folding the azimuth onto the
+	// absolute axes reaches directly; the other three differ by the sign of a
+	// row. The epsilon also covers looking straight down the normal, where the
+	// azimuth is undefined and the table does not depend on it.
+	float alpha_max = max(alpha_x, alpha_y);
+	vec4 lut_pos = vec4(
+			atan(abs(view_azimuth.y), max(abs(view_azimuth.x), float(1e-20))) / float(0.5 * M_PI),
+			theta,
+			min(alpha_x, alpha_y) / alpha_max,
+			(alpha_max - 0.001) / 0.999);
+	vec3 mirror = vec3(view_azimuth.x < 0.0 ? -1.0 : 1.0, view_azimuth.y < 0.0 ? -1.0 : 1.0, 1.0);
+
+	mat3 m = ltc_aniso_lut_fetch(lut_pos, lut_sampler, ltc_lut_aniso);
+	m = mat3(m[0] * mirror, m[1] * mirror, m[2] * mirror);
+	if (swap_axes) {
+		m = mat3(m[0].yxz, m[1].yxz, m[2].yxz);
+	}
+
+	// The table holds the forward matrix in a frame with the normal on +Z:
+	// invert it, then move the cosine lobe's axis from +Z to +Y.
+	//
+	// The determinant has to be divided out rather than left in: the line
+	// integral is invariant to a uniform scale of the matrix, but the
+	// regularization in ltc_evaluate_line_transformed() is in absolute units, so
+	// leaving it in makes sharp lobes (whose matrices are tiny) fall under those
+	// thresholds and go black. A few entries round to singular in fp16, so clamp
+	// the magnitude while keeping the sign; the matrix is then merely very
+	// sharp instead of infinite.
+	float det_m = determinant(m);
+	mat3 m_inv = ltc_adjugate(m) * (1.0 / (max(abs(det_m), 1e-9) * (det_m < 0.0 ? -1.0 : 1.0)));
+	return mat3(m_inv[0].xzy, m_inv[1].xzy, m_inv[2].xzy) * transpose(mat3(tangent, binormal, normal));
+}
+
+void ltc_evaluate_line_specular_anisotropic(vec3 normal, vec3 tangent, vec3 binormal, vec3 eye_vec, float roughness, float anisotropy, vec3 p1, vec3 p2, float min_radius, sampler lut_sampler, texture2D ltc_lut2, texture3D ltc_lut_aniso, out float ltc_specular, out vec2 fresnel) {
+	// Only the shape of the lobe is anisotropic here: an LTC is invariant to a
+	// uniform scale of its matrix, so all of the energy still comes from the
+	// isotropic table, which is also the only one that carries Fresnel. Both
+	// tables share the view elevation, so it is computed once.
+	float theta = ltc_theta(dot(normal, eye_vec));
+	fresnel = texture(sampler2D(ltc_lut2, lut_sampler), ltc_lut_uv(roughness, theta)).yz;
+
+	// Same mapping as the anisotropic GGX in light_compute(), clamped to the
+	// unit range the table was fitted over. light_compute() leaves these
+	// unclamped, so at high roughness a punctual light and a line light disagree
+	// slightly on the lobe's aspect ratio, which is the price of an 8^4 table.
+	float alpha = roughness * roughness;
+	float aspect = sqrt(1.0 - anisotropy * 0.9);
+	mat3 M_inv = ltc_matrix_anisotropic(normal, tangent, binormal, eye_vec, theta,
+			clamp(alpha / aspect, 0.001, 1.0), clamp(alpha * aspect, 0.001, 1.0),
+			lut_sampler, ltc_lut_aniso);
+
+	ltc_specular = ltc_evaluate_line_transformed(M_inv, p1, p2, min_radius);
+}
+
+#endif // LIGHT_ANISOTROPY_USED
 
 // Form factor function for area light, taken from Urena, Fajardo, et.al. (2013): An Area-Preserving Parametrization for Spherical Rectangles
 float quad_solid_angle(vec3 L[4]) {
