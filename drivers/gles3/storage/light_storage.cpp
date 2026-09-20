@@ -127,6 +127,20 @@ void LightStorage::area_light_initialize(RID p_rid) {
 	_light_initialize(p_rid, RSE::LIGHT_AREA);
 }
 
+RID LightStorage::line_light_allocate() {
+	return light_owner.allocate_rid();
+}
+
+void LightStorage::line_light_initialize(RID p_rid) {
+	_light_initialize(p_rid, RSE::LIGHT_LINE);
+
+	// Line lights support neither shadows nor baked GI yet, so keep them out of
+	// every baker and shadow path from the start (the struct default is DYNAMIC).
+	Light *light = light_owner.get_or_null(p_rid);
+	ERR_FAIL_NULL(light);
+	light->bake_mode = RSE::LIGHT_BAKE_DISABLED;
+}
+
 void LightStorage::light_free(RID p_rid) {
 	light_set_projector(p_rid, RID()); //clear projector
 
@@ -181,11 +195,9 @@ void LightStorage::light_set_param(RID p_light, RSE::LightParam p_param, float p
 void LightStorage::light_set_shadow(RID p_light, bool p_enabled) {
 	Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL(light);
-	if (light->type == RSE::LIGHT_AREA) {
-		light->shadow = false;
-	} else {
-		light->shadow = p_enabled;
-	}
+	// Area and line lights have no shadow implementation here. Refusing at the
+	// setter keeps every shadow path unreachable for them.
+	light->shadow = p_enabled && light->type != RSE::LIGHT_AREA && light->type != RSE::LIGHT_LINE;
 
 	light->version++;
 	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
@@ -197,6 +209,12 @@ void LightStorage::light_set_projector(RID p_light, RID p_texture) {
 	ERR_FAIL_NULL(light);
 
 	if (light->projector == p_texture) {
+		return;
+	}
+
+	// Line lights have no projector support. Refusing here keeps them out of the
+	// decal atlas and stops them from forcing the projector shader variant.
+	if (light->type == RSE::LIGHT_LINE) {
 		return;
 	}
 
@@ -272,7 +290,9 @@ void LightStorage::light_set_bake_mode(RID p_light, RSE::LightBakeMode p_bake_mo
 	Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL(light);
 
-	light->bake_mode = p_bake_mode;
+	// Line lights are not supported by any GI baker yet; keeping them disabled
+	// means every baker skips them without extra checks.
+	light->bake_mode = light->type == RSE::LIGHT_LINE ? RSE::LIGHT_BAKE_DISABLED : p_bake_mode;
 
 	light->version++;
 	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
@@ -364,6 +384,21 @@ bool LightStorage::light_area_get_normalize_energy(RID p_light) const {
 	return light->area_normalize_energy;
 }
 
+void LightStorage::light_line_set_length(RID p_light, float p_length) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+	light->line_length = MAX(p_length, 0.0f);
+	light->version++;
+	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
+}
+
+void LightStorage::light_line_set_normalize_energy(RID p_light, bool p_enabled) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+	// Shared with area lights: both mean "divide energy by the emitter's size".
+	light->area_normalize_energy = p_enabled;
+}
+
 void LightStorage::light_area_set_texture(RID p_light, RID p_texture) {
 	// not implemented
 }
@@ -420,6 +455,13 @@ AABB LightStorage::light_get_aabb(RID p_light) const {
 			float height = light->area_size.y / 2.0 + len;
 
 			return AABB(-Vector3(width, height, 0), Vector3(width * 2, height * 2, -len));
+		};
+		case RSE::LIGHT_LINE: {
+			// The segment lies along local X and lights in every direction.
+			float len = light->param[RSE::LIGHT_PARAM_RANGE];
+			float half_width = light->line_length / 2.0 + len;
+
+			return AABB(-Vector3(half_width, len, len), Vector3(half_width, len, len) * 2.0);
 		};
 		case RSE::LIGHT_DIRECTIONAL: {
 			return AABB();

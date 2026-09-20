@@ -194,6 +194,14 @@ AABB Light3D::get_aabb() const {
 		float height = l->get_area_size().y / 2.0 + len;
 
 		return AABB(-Vector3(width, height, 0), Vector3(width * 2, height * 2, -len));
+	} else if (type == RSE::LIGHT_LINE) {
+		// The segment lies along local X and lights in every direction.
+		float len = param[PARAM_RANGE];
+
+		const LineLight3D *l = Object::cast_to<const LineLight3D>(this);
+		float half_width = l->get_line_length() / 2.0 + len;
+
+		return AABB(-Vector3(half_width, len, len), Vector3(half_width, len, len) * 2.0);
 	}
 
 	return AABB();
@@ -496,6 +504,9 @@ Light3D::Light3D(RSE::LightType p_type) {
 			break;
 		case RSE::LIGHT_AREA:
 			light = RenderingServer::get_singleton()->area_light_create();
+			break;
+		case RSE::LIGHT_LINE:
+			light = RenderingServer::get_singleton()->line_light_create();
 			break;
 		default: {
 		};
@@ -816,4 +827,63 @@ AreaLight3D::~AreaLight3D() {
 	if (light.is_valid()) {
 		RenderingServer::get_singleton()->free_rid(light);
 	}
+}
+
+void LineLight3D::set_line_length(float p_length) {
+	line_length = MAX(p_length, 0.0f);
+	RS::get_singleton()->light_line_set_length(light, line_length);
+
+	update_gizmos();
+}
+
+float LineLight3D::get_line_length() const {
+	return line_length;
+}
+
+void LineLight3D::set_line_normalize_energy(bool p_enabled) {
+	line_normalize_energy = p_enabled;
+	RS::get_singleton()->light_line_set_normalize_energy(light, p_enabled);
+}
+
+bool LineLight3D::is_line_normalizing_energy() const {
+	return line_normalize_energy;
+}
+
+void LineLight3D::_validate_property(PropertyInfo &p_property) const {
+	// Line lights support neither shadows, baked GI nor light textures yet.
+	// `light_size` is re-exposed as `line_radius`, which is what it means here.
+	if (p_property.name.begins_with("shadow_") || p_property.name == "light_bake_mode" ||
+			p_property.name == "light_indirect_energy" || p_property.name == "light_volumetric_fog_energy" ||
+			p_property.name == "distance_fade_shadow" || p_property.name == "light_projector" ||
+			p_property.name == "light_size") {
+		p_property.usage = PROPERTY_USAGE_NONE;
+	}
+}
+
+LineLight3D::LineLight3D() :
+		Light3D(RSE::LIGHT_LINE) {
+	set_param(PARAM_SPECULAR, 1.0);
+	// A zero-thickness segment is singular on contact; this is the minimum
+	// distance used to regularize it, in metres.
+	set_param(PARAM_SIZE, 0.01);
+	// No GI baker supports line lights yet. The server refuses any other mode,
+	// so keep the node in sync; LightmapGI filters on the node's value.
+	set_bake_mode(BAKE_DISABLED);
+	set_line_length(1.0);
+	set_line_normalize_energy(true);
+}
+
+void LineLight3D::_bind_methods() {
+	ClassDB::bind_method(D_METHOD("set_line_length", "length"), &LineLight3D::set_line_length);
+	ClassDB::bind_method(D_METHOD("get_line_length"), &LineLight3D::get_line_length);
+
+	ClassDB::bind_method(D_METHOD("set_line_normalize_energy", "enable"), &LineLight3D::set_line_normalize_energy);
+	ClassDB::bind_method(D_METHOD("is_line_normalizing_energy"), &LineLight3D::is_line_normalizing_energy);
+
+	ADD_GROUP("Line", "line_");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "line_length", PROPERTY_HINT_RANGE, "0,4096,0.001,or_greater,suffix:m"), "set_line_length", "get_line_length");
+	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "line_range", PROPERTY_HINT_RANGE, "0,4096,0.001,or_greater,exp,suffix:m"), "set_param", "get_param", PARAM_RANGE);
+	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "line_attenuation", PROPERTY_HINT_RANGE, "-10,10,0.001,or_greater,or_less"), "set_param", "get_param", PARAM_ATTENUATION);
+	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "line_radius", PROPERTY_HINT_RANGE, "0.001,1,0.001,or_greater,suffix:m"), "set_param", "get_param", PARAM_SIZE);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "line_normalize_energy"), "set_line_normalize_energy", "is_line_normalizing_energy");
 }

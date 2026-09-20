@@ -69,6 +69,8 @@ public:
 	virtual void spot_light_initialize(RID p_rid) override {}
 	virtual RID area_light_allocate() override { return RID(); }
 	virtual void area_light_initialize(RID p_rid) override {}
+	virtual RID line_light_allocate() override { return RID(); }
+	virtual void line_light_initialize(RID p_rid) override {}
 
 	virtual void light_free(RID p_rid) override {}
 
@@ -104,6 +106,9 @@ public:
 	virtual bool light_area_get_normalize_energy(RID p_light) const override { return true; }
 	virtual void light_area_set_texture(RID p_light, RID p_texture) override {}
 	virtual RID light_area_get_texture(RID p_light) const override { return RID(); }
+
+	virtual void light_line_set_length(RID p_light, float p_length) override {}
+	virtual void light_line_set_normalize_energy(RID p_light, bool p_enabled) override {}
 
 	virtual bool light_has_shadow(RID p_light) const override { return false; }
 	virtual bool light_has_projector(RID p_light) const override { return false; }

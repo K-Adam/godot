@@ -67,6 +67,7 @@ struct Light {
 	bool directional_blend_splits = false;
 	RSE::LightDirectionalSkyMode directional_sky_mode = RSE::LIGHT_DIRECTIONAL_SKY_MODE_LIGHT_AND_SKY;
 	Vector2 area_size = Vector2(1, 1);
+	float line_length = 1.0;
 	bool area_normalize_energy = true;
 	RID area_texture;
 	uint64_t version = 0;
@@ -323,6 +324,9 @@ public:
 	virtual RID area_light_allocate() override;
 	virtual void area_light_initialize(RID p_rid) override;
 
+	virtual RID line_light_allocate() override;
+	virtual void line_light_initialize(RID p_rid) override;
+
 	virtual void light_free(RID p_rid) override;
 
 	virtual void light_set_color(RID p_light, const Color &p_color) override;
@@ -355,6 +359,9 @@ public:
 	virtual bool light_area_get_normalize_energy(RID p_light) const override;
 	virtual void light_area_set_texture(RID p_light, RID p_texture) override;
 	virtual RID light_area_get_texture(RID p_light) const override;
+
+	virtual void light_line_set_length(RID p_light, float p_length) override;
+	virtual void light_line_set_normalize_energy(RID p_light, bool p_enabled) override;
 
 	virtual RSE::LightDirectionalShadowMode light_directional_get_shadow_mode(RID p_light) override;
 	virtual RSE::LightOmniShadowMode light_omni_get_shadow_mode(RID p_light) override;

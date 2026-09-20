@@ -490,6 +490,7 @@ public:
 	FUNCRIDSPLIT(omni_light)
 	FUNCRIDSPLIT(spot_light)
 	FUNCRIDSPLIT(area_light)
+	FUNCRIDSPLIT(line_light)
 
 	FUNC2(light_set_color, RID, const Color &)
 	FUNC3(light_set_param, RID, RSE::LightParam, float)
@@ -513,6 +514,9 @@ public:
 	FUNC2(light_area_set_size, RID, const Vector2 &)
 	FUNC2(light_area_set_normalize_energy, RID, bool)
 	FUNC2(light_area_set_texture, RID, RID)
+
+	FUNC2(light_line_set_length, RID, float)
+	FUNC2(light_line_set_normalize_energy, RID, bool)
 
 	/* PROBE API */
 

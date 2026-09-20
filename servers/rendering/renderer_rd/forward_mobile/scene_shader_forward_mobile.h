@@ -137,6 +137,15 @@ public:
 			float packed_2;
 			float luminance_multiplier;
 		};
+
+		// packed_0 and packed_1 are both exactly 32 bits wide already.
+		union {
+			uint32_t packed_3;
+
+			struct {
+				uint32_t line_lights : 2;
+			};
+		};
 	};
 
 	struct UbershaderConstants {
@@ -212,6 +221,7 @@ public:
 				h = hash_murmur3_one_32(shader_specialization.packed_0, h);
 				h = hash_murmur3_one_32(shader_specialization.packed_1, h);
 				h = hash_murmur3_one_float(shader_specialization.packed_2, h);
+				h = hash_murmur3_one_32(shader_specialization.packed_3, h);
 				h = hash_murmur3_one_32(version, h);
 				h = hash_murmur3_one_32(render_pass, h);
 				h = hash_murmur3_one_32(wireframe, h);

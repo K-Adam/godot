@@ -141,6 +141,7 @@ public:
 		LIGHT_TYPE_OMNI,
 		LIGHT_TYPE_SPOT,
 		LIGHT_TYPE_AREA,
+		LIGHT_TYPE_LINE,
 	};
 
 	enum BoxType {
@@ -154,6 +155,9 @@ public:
 		ELEMENT_TYPE_AREA_LIGHT,
 		ELEMENT_TYPE_DECAL,
 		ELEMENT_TYPE_REFLECTION_PROBE,
+		// Keep new element types appended: the shaders index cluster ranges by
+		// `cluster_type_size * <element type>`.
+		ELEMENT_TYPE_LINE_LIGHT,
 		ELEMENT_TYPE_MAX,
 	};
 
@@ -161,7 +165,7 @@ private:
 	ClusterBuilderSharedDataRD *shared = nullptr;
 
 	struct RenderElementData {
-		uint32_t type; // 0-4
+		uint32_t type; // ElementType
 		uint32_t touches_near;
 		uint32_t touches_far;
 		uint32_t original_index;
@@ -241,6 +245,9 @@ public:
 			return; // Max number elements reached.
 		}
 		if (p_type == LIGHT_TYPE_AREA && cluster_count_by_type[ELEMENT_TYPE_AREA_LIGHT] == max_elements_by_type) {
+			return; // Max number elements reached.
+		}
+		if (p_type == LIGHT_TYPE_LINE && cluster_count_by_type[ELEMENT_TYPE_LINE_LIGHT] == max_elements_by_type) {
 			return; // Max number elements reached.
 		}
 
@@ -332,15 +339,23 @@ public:
 			RendererRD::MaterialStorage::store_transform_transposed_3x4(xform, e.transform_inv);
 
 			cluster_count_by_type[ELEMENT_TYPE_SPOT_LIGHT]++;
-		} else { /* LIGHT_TYPE_AREA */
-			Vector3 scale = Vector3(p_area_size.x / 2.0 + radius, p_area_size.y / 2.0 + radius, radius / 2.0);
+		} else { /* LIGHT_TYPE_AREA or LIGHT_TYPE_LINE, both bounded by a box */
+			const bool is_area = p_type == LIGHT_TYPE_AREA;
+			// An area light only emits towards -Z, so its box is half as deep and
+			// offset. A line light emits in every direction around its segment,
+			// which lies along X with a length of p_area_size.x.
+			Vector3 scale = is_area
+					? Vector3(p_area_size.x / 2.0 + radius, p_area_size.y / 2.0 + radius, radius / 2.0)
+					: Vector3(p_area_size.x / 2.0 + radius, radius, radius);
 
 			for (uint32_t i = 0; i < 3; i++) {
 				float s = xform.basis.rows[i].length();
 				//scale[i] *= s; // lights ignore scale
 				xform.basis.rows[i] /= s;
 			}
-			xform.origin -= xform.basis.get_column(Vector3::AXIS_Z) * scale.z; // translate center to center of box
+			if (is_area) {
+				xform.origin -= xform.basis.get_column(Vector3::AXIS_Z) * scale.z; // translate center to center of box
+			}
 
 			float depth = -xform.origin.z;
 			float box_depth = Math::abs(xform.basis.xform_inv(Vector3(0, 0, -1)).dot(scale));
@@ -359,12 +374,13 @@ public:
 			e.scale[1] = scale.y;
 			e.scale[2] = scale.z;
 
-			e.type = ELEMENT_TYPE_AREA_LIGHT;
-			e.original_index = cluster_count_by_type[ELEMENT_TYPE_AREA_LIGHT];
+			const ElementType element_type = is_area ? ELEMENT_TYPE_AREA_LIGHT : ELEMENT_TYPE_LINE_LIGHT;
+			e.type = element_type;
+			e.original_index = cluster_count_by_type[element_type];
 
 			RendererRD::MaterialStorage::store_transform_transposed_3x4(xform, e.transform_inv);
 
-			cluster_count_by_type[ELEMENT_TYPE_AREA_LIGHT]++;
+			cluster_count_by_type[element_type]++;
 		}
 
 		render_element_count++;

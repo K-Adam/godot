@@ -10,6 +10,26 @@ float acos_approx(float p_x) {
 	return (p_x >= 0) ? res : M_PI - res;
 }
 
+// Fetches the inverse LTC matrix that turns the clamped cosine distribution into
+// the GGX lobe for this roughness and view angle, plus the amplitude and Fresnel
+// terms in `fresnel`.
+mat3 ltc_matrix(vec3 normal, vec3 eye_vec, float roughness, sampler lut_sampler, texture2D ltc_lut1, texture2D ltc_lut2, out vec2 fresnel) {
+	float theta = acos_approx(dot(normal, eye_vec));
+	const float LTC_LUT_SIZE = float(64.0);
+	vec2 lut_pos = vec2(max(roughness, float(0.02)), theta / float(0.5 * M_PI));
+	vec2 lut_uv = vec2(lut_pos * (float(63.0) / LTC_LUT_SIZE) + vec2(float(0.5) / LTC_LUT_SIZE)); // offset by 1 pixel
+	vec4 M_brdf_abcd = texture(sampler2D(ltc_lut1, lut_sampler), lut_uv);
+	vec3 M_brdf_e_mag_fres = texture(sampler2D(ltc_lut2, lut_sampler), lut_uv).xyz;
+	float scale = 1.0 / (M_brdf_abcd.x * M_brdf_e_mag_fres.x - M_brdf_abcd.y * M_brdf_abcd.w);
+
+	fresnel = vec2(M_brdf_e_mag_fres.yz);
+
+	return mat3(
+			vec3(0, 0, 1.0 / M_brdf_abcd.z),
+			vec3(-M_brdf_abcd.w * scale, M_brdf_abcd.x * scale, 0),
+			vec3(-M_brdf_e_mag_fres.x * scale, M_brdf_abcd.y * scale, 0));
+}
+
 vec3 fetch_ltc_lod(vec2 uv, vec4 texture_rect, float lod, float max_mipmap, texture2D area_light_atlas, sampler texture_sampler) {
 	float low = min(max(floor(lod), 0.0), max_mipmap - 1.0);
 	float high = min(max(floor(lod + 1.0), 1.0), max_mipmap);
@@ -131,6 +151,113 @@ vec3 fetch_ltc_filtered_texture_with_form_factor(vec4 texture_rect, vec3 L[4], f
 		lod = log(2048.0 * lod) / log(3.0);
 	}
 	return fetch_ltc_lod(vec2(1.0) - uv, texture_rect, lod, max_mipmap, area_light_atlas, texture_sampler);
+}
+
+/* Line lights.
+ *
+ * A zero-thickness segment of unit linear intensity contributes
+ *     INT_segment f(w) * sin(phi) / r^2 dl,
+ * where phi is the angle between the direction to the sample and the segment
+ * tangent, so sin(phi) / r^2 == d / r^3 with d the perpendicular distance to
+ * the infinite line. The sin(phi) factor is the cylinder's projected width: a
+ * line light is brightest broadside and goes dark end-on.
+ *
+ * Closed form from Heitz and Hill, "Real-Time Line- and Disk-Light Shading with
+ * Linearly Transformed Cosines". Note these functions return half of their
+ * I_diffuse_line: their extra factor of 2 pairs with multiplying by a tube
+ * radius, while we normalize so a short broadside line matches an omni light.
+ */
+// A zero-thickness segment is singular where a surface touches it. Distances are
+// never allowed below this, which is what makes the closed forms finite (and
+// keeps their results inside fp16 range downstream).
+#define LINE_LIGHT_MIN_DISTANCE 0.001
+
+float line_Fpo(float p_d, float p_l) {
+	return p_l / (p_d * (p_d * p_d + p_l * p_l)) + atan(p_l, p_d) / (p_d * p_d);
+}
+
+float line_Fwt(float p_d, float p_l) {
+	return p_l * p_l / (p_d * (p_d * p_d + p_l * p_l));
+}
+
+// Exact clamped-cosine (Lambertian) integral over the segment p1..p2, with the
+// shading point at the origin. Returns the integral divided by PI, matching the
+// normalization of ltc_evaluate(). `n` is the shading normal, so that the
+// diffuse case can be evaluated directly in world space; the LTC case passes
+// +Y, the normal of the transformed configuration.
+float line_integrate_diffuse(vec3 p1, vec3 p2, vec3 n, float min_distance) {
+	float n1 = dot(p1, n);
+	float n2 = dot(p2, n);
+	if (n1 <= 0.0 && n2 <= 0.0) {
+		return 0.0; // Fully below the horizon.
+	}
+
+	vec3 wt = normalize(p2 - p1);
+
+	// Clip to the horizon. The remaining segment is above it throughout, which is
+	// exactly the clamping of the cosine term.
+	if (n1 < 0.0) {
+		p1 = (p1 * n2 - p2 * n1) / (n2 - n1);
+	} else if (n2 < 0.0) {
+		p2 = (p2 * n1 - p1 * n2) / (n1 - n2);
+	}
+
+	float l1 = dot(p1, wt);
+	float l2 = dot(p2, wt);
+	vec3 po = p1 - l1 * wt; // Closest point on the infinite line to the origin.
+
+	// Regularize the 1/d singularity by pushing the shading point out to
+	// min_distance, keeping the direction. This is the zero-thickness stand-in
+	// for a tube of that radius.
+	float d0 = length(po);
+	float d = max(d0, max(min_distance, LINE_LIGHT_MIN_DISTANCE));
+	po *= d / max(d0, 1e-9);
+
+	float I = (line_Fpo(d, l2) - line_Fpo(d, l1)) * dot(po, n) +
+			(line_Fwt(d, l2) - line_Fwt(d, l1)) * dot(wt, n);
+	return 0.5 * I / M_PI;
+}
+
+// Unclamped INT sin(phi) / r^2 dl, the line analogue of quad_solid_angle().
+// Antiderivative of d / (d^2 + l^2)^(3/2) is l / (d * sqrt(d^2 + l^2)).
+float line_measure(vec3 p1, vec3 p2, float min_distance) {
+	vec3 wt = normalize(p2 - p1);
+	float l1 = dot(p1, wt);
+	float l2 = dot(p2, wt);
+	float d = max(length(p1 - l1 * wt), max(min_distance, LINE_LIGHT_MIN_DISTANCE));
+	return (l2 / sqrt(d * d + l2 * l2) - l1 / sqrt(d * d + l1 * l1)) / d;
+}
+
+// LTC integral over a line: transform the endpoints, integrate as a clamped
+// cosine, then correct for how the transform rescales the segment's width.
+// The diffuse case is M_inv == identity, where the width factor is exactly 1;
+// call line_integrate_diffuse() directly with the shading normal instead.
+float ltc_evaluate_line(vec3 normal, vec3 eye_vec, mat3 M_inv, vec3 p1, vec3 p2, float min_radius) {
+	// Orthonormal basis around the normal, matching ltc_evaluate().
+	vec3 z = -normalize(eye_vec - normal * dot(eye_vec, normal));
+	vec3 x = cross(normal, z);
+	M_inv = M_inv * transpose(mat3(x, normal, z));
+
+	vec3 l1 = M_inv * p1;
+	vec3 l2 = M_inv * p2;
+
+	// Width factor 1 / |M_inv^-T * normalize(cross(p1, p2))|, rewritten with
+	// cross(M a, M b) == det(M) * M^-T cross(a, b) to avoid a matrix inverse.
+	vec3 cm = cross(l1, l2);
+	float cm_len = length(cm);
+	float c_len = length(cross(p1, p2));
+	if (cm_len < 1e-6 * c_len) {
+		return 0.0; // Segment is collinear with the shading point.
+	}
+	float w = abs(determinant(M_inv)) * c_len / cm_len;
+
+	// The same physical radius is a w times larger distance after the transform.
+	return w * line_integrate_diffuse(l1, l2, vec3(0.0, 1.0, 0.0), w * min_radius);
+}
+
+void ltc_evaluate_line_specular(vec3 normal, vec3 eye_vec, float roughness, vec3 p1, vec3 p2, float min_radius, sampler lut_sampler, texture2D ltc_lut1, texture2D ltc_lut2, out float ltc_specular, out vec2 fresnel) {
+	mat3 M_inv = ltc_matrix(normal, eye_vec, roughness, lut_sampler, ltc_lut1, ltc_lut2, fresnel);
+	ltc_specular = ltc_evaluate_line(normal, eye_vec, M_inv, p1, p2, min_radius);
 }
 
 // Form factor function for area light, taken from Urena, Fajardo, et.al. (2013): An Area-Preserving Parametrization for Spherical Rectangles
@@ -323,21 +450,9 @@ void ltc_evaluate(vec3 normal, vec3 eye_vec, mat3 M_inv, vec3 points[4], vec4 te
 }
 
 void ltc_evaluate_specular(vec3 normal, vec3 eye_vec, float roughness, vec3 points[4], vec4 texture_rect, float max_mipmap, texture2D area_light_atlas, sampler texture_sampler, sampler lut_sampler, texture2D ltc_lut1, texture2D ltc_lut2, out float ltc_specular, out vec2 fresnel, out vec3 ltc_specular_tex_color) {
-	float theta = acos_approx(dot(normal, eye_vec));
-	const float LTC_LUT_SIZE = float(64.0);
-	vec2 lut_pos = vec2(max(roughness, float(0.02)), theta / float(0.5 * M_PI));
-	vec2 lut_uv = vec2(lut_pos * (float(63.0) / LTC_LUT_SIZE) + vec2(float(0.5) / LTC_LUT_SIZE)); // offset by 1 pixel
-	vec4 M_brdf_abcd = texture(sampler2D(ltc_lut1, lut_sampler), lut_uv);
-	vec3 M_brdf_e_mag_fres = texture(sampler2D(ltc_lut2, lut_sampler), lut_uv).xyz;
-	float scale = 1.0 / (M_brdf_abcd.x * M_brdf_e_mag_fres.x - M_brdf_abcd.y * M_brdf_abcd.w);
-
-	mat3 M_inv = mat3(
-			vec3(0, 0, 1.0 / M_brdf_abcd.z),
-			vec3(-M_brdf_abcd.w * scale, M_brdf_abcd.x * scale, 0),
-			vec3(-M_brdf_e_mag_fres.x * scale, M_brdf_abcd.y * scale, 0));
+	mat3 M_inv = ltc_matrix(normal, eye_vec, roughness, lut_sampler, ltc_lut1, ltc_lut2, fresnel);
 
 	ltc_evaluate(normal, eye_vec, M_inv, points, texture_rect, max_mipmap, area_light_atlas, texture_sampler, ltc_specular, ltc_specular_tex_color);
-	fresnel = vec2(M_brdf_e_mag_fres.yz);
 }
 
 void ltc_evaluate_diff(vec3 normal, vec3 points[4], vec4 texture_rect, float max_mipmap, texture2D area_light_atlas, sampler texture_sampler, out float integral, out vec3 tex_color) {

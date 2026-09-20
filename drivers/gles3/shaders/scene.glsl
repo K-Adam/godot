@@ -13,6 +13,7 @@ DISABLE_LIGHT_DIRECTIONAL = false
 DISABLE_LIGHT_OMNI = false
 DISABLE_LIGHT_SPOT = false
 DISABLE_LIGHT_AREA = false
+DISABLE_LIGHT_LINE = false
 DISABLE_REFLECTION_PROBE = true
 DISABLE_FOG = false
 USE_DEPTH_FOG = false
@@ -1317,7 +1318,7 @@ uniform highp sampler2DShadow directional_shadow_atlas; // texunit:-3
 #endif // !DISABLE_LIGHT_DIRECTIONAL || USE_SUN_SCATTER
 
 // Omni, spot, and area light data.
-#if !defined(DISABLE_LIGHT_OMNI) || !defined(DISABLE_LIGHT_SPOT) || !defined(DISABLE_LIGHT_AREA) || defined(ADDITIVE_OMNI) || defined(ADDITIVE_SPOT)
+#if !defined(DISABLE_LIGHT_OMNI) || !defined(DISABLE_LIGHT_SPOT) || !defined(DISABLE_LIGHT_AREA) || !defined(DISABLE_LIGHT_LINE) || defined(ADDITIVE_OMNI) || defined(ADDITIVE_SPOT)
 
 struct LightData { // This structure needs to be as packed as possible.
 	highp vec3 position;
@@ -1365,8 +1366,6 @@ uniform uint spot_light_count;
 layout(std140) uniform AreaLightData { // ubo:7
 	LightData area_lights[MAX_LIGHT_DATA_STRUCTS];
 };
-uniform highp sampler2D ltc_lut1; // texunit:-10
-uniform highp sampler2D ltc_lut2; // texunit:-11
 
 #if defined(BASE_PASS) && !defined(USE_VERTEX_LIGHTING)
 uniform uint area_light_indices[MAX_FORWARD_LIGHTS];
@@ -1374,7 +1373,24 @@ uniform uint area_light_count;
 #endif // defined(BASE_PASS) && !defined(USE_VERTEX_LIGHTING)
 #endif // !defined(DISABLE_LIGHT_AREA)
 
-#endif // !defined(DISABLE_LIGHT_OMNI) || !defined(DISABLE_LIGHT_SPOT) || !defined(DISABLE_LIGHT_AREA) || defined(ADDITIVE_OMNI) || defined(ADDITIVE_SPOT)
+#if !defined(DISABLE_LIGHT_LINE)
+layout(std140) uniform LineLightData { // ubo:16
+	LightData line_lights[MAX_LIGHT_DATA_STRUCTS];
+};
+
+#if defined(BASE_PASS) && !defined(USE_VERTEX_LIGHTING)
+uniform uint line_light_indices[MAX_FORWARD_LIGHTS];
+uniform uint line_light_count;
+#endif // defined(BASE_PASS) && !defined(USE_VERTEX_LIGHTING)
+#endif // !defined(DISABLE_LIGHT_LINE)
+
+// The LTC lookup tables are shared by area and line lights.
+#if !defined(DISABLE_LIGHT_AREA) || !defined(DISABLE_LIGHT_LINE)
+uniform highp sampler2D ltc_lut1; // texunit:-10
+uniform highp sampler2D ltc_lut2; // texunit:-11
+#endif
+
+#endif // !defined(DISABLE_LIGHT_OMNI) || !defined(DISABLE_LIGHT_SPOT) || !defined(DISABLE_LIGHT_AREA) || !defined(DISABLE_LIGHT_LINE) || defined(ADDITIVE_OMNI) || defined(ADDITIVE_SPOT)
 
 #ifdef USE_ADDITIVE_LIGHTING
 #ifdef ADDITIVE_OMNI
@@ -1559,7 +1575,7 @@ vec3 F0(float metallic, float specular, vec3 albedo) {
 #ifndef MODE_RENDER_DEPTH
 
 #ifndef USE_VERTEX_LIGHTING
-#if !defined(DISABLE_LIGHT_DIRECTIONAL) || !defined(DISABLE_LIGHT_OMNI) || !defined(DISABLE_LIGHT_SPOT) || !defined(DISABLE_LIGHT_AREA) || defined(USE_ADDITIVE_LIGHTING) || defined(USE_SH_LIGHTMAP)
+#if !defined(DISABLE_LIGHT_DIRECTIONAL) || !defined(DISABLE_LIGHT_OMNI) || !defined(DISABLE_LIGHT_SPOT) || !defined(DISABLE_LIGHT_AREA) || !defined(DISABLE_LIGHT_LINE) || defined(USE_ADDITIVE_LIGHTING) || defined(USE_SH_LIGHTMAP)
 
 float D_GGX(float cos_theta_m, float alpha) {
 	float a = cos_theta_m * alpha;
@@ -1812,9 +1828,13 @@ void light_process_omni(uint idx, vec3 vertex, vec3 eye_vec, vec3 normal, vec3 f
 }
 #endif // !DISABLE_LIGHT_OMNI
 
-#if !defined(DISABLE_LIGHT_AREA)
+#if !defined(DISABLE_LIGHT_AREA) || !defined(DISABLE_LIGHT_LINE)
 
 #include "area_lights_inc.glsl"
+
+#endif // !defined(DISABLE_LIGHT_AREA) || !defined(DISABLE_LIGHT_LINE)
+
+#if !defined(DISABLE_LIGHT_AREA)
 
 // implementation of area lights with Linearly Transformed Cosines (LTC): https://eheitzresearch.wordpress.com/415-2/
 void light_process_area(uint idx, vec3 vertex, vec3 eye_vec, vec3 normal, vec3 f0, float roughness, float metallic, float shadow, vec3 albedo, inout float alpha, vec2 screen_uv,
@@ -1958,6 +1978,141 @@ void light_process_area(uint idx, vec3 vertex, vec3 eye_vec, vec3 normal, vec3 f
 }
 #endif // !DISABLE_LIGHT_AREA
 
+#if !defined(DISABLE_LIGHT_LINE)
+// Finite zero-thickness line light. Diffuse uses the exact Lambertian line
+// integral; specular uses the same integral under the LTC transform for GGX.
+// Line lights have no shadows and no texture.
+void light_process_line(uint idx, vec3 vertex, vec3 eye_vec, vec3 normal, vec3 f0, float roughness, float metallic, vec3 albedo, inout float alpha, vec2 screen_uv,
+#ifdef LIGHT_BACKLIGHT_USED
+		vec3 backlight,
+#endif
+#ifdef LIGHT_RIM_USED
+		float rim, float rim_tint,
+#endif
+#ifdef LIGHT_CLEARCOAT_USED
+		float clearcoat, float clearcoat_roughness, vec3 vertex_normal,
+#endif
+		inout vec3 diffuse_light, inout vec3 specular_light) {
+	vec3 segment = line_lights[idx].area_width.xyz;
+	float length_sq = dot(segment, segment);
+	if (length_sq < 1e-12) {
+		return; // Zero-length segment emits nothing.
+	}
+
+	vec3 half_segment = segment * 0.5;
+	vec3 light_center = line_lights[idx].position - vertex;
+	vec3 p1 = light_center - half_segment;
+	vec3 p2 = light_center + half_segment;
+
+	// Distance to the closest point on the segment drives the range falloff.
+	float t = clamp(dot(-p1, segment) / length_sq, 0.0, 1.0);
+	vec3 closest_point = p1 + segment * t;
+	float min_radius = max(line_lights[idx].size, 0.0);
+	float dist_to_segment = max(length(closest_point), min_radius);
+
+	float light_attenuation = get_omni_spot_attenuation(dist_to_segment, line_lights[idx].inv_radius, line_lights[idx].attenuation);
+	// The line integral already falls off with the inverse square of distance, so
+	// cancel it here and keep only the artistic range window, as area lights do.
+	// This is the value that scales the result, so it is also what decides whether
+	// there is anything to do; `light_attenuation` alone would cut the light off at
+	// a fixed distance regardless of its range.
+	float light_attenuation_ltc = light_attenuation * dist_to_segment * dist_to_segment;
+	if (light_attenuation_ltc < 1e-5) {
+		return;
+	}
+
+	vec3 light_color = line_lights[idx].color;
+
+	float ltc_diffuse = line_integrate_diffuse(p1, p2, normal, min_radius);
+
+	float ltc_specular = 0.0;
+	vec2 ltc_fresnel = vec2(0.0);
+	vec3 fresnel_color = vec3(0.0);
+#if !defined(SPECULAR_DISABLED) || (defined(LIGHT_CODE_USED) && defined(AREA_LIGHT_CODE_USED))
+	ltc_evaluate_line_specular(normal, eye_vec, roughness, p1, p2, min_radius, ltc_lut1, ltc_lut2, ltc_specular, ltc_fresnel);
+	float f90 = clamp(dot(f0, vec3(50.0 * 0.33)), metallic, 1.0);
+	fresnel_color = f0 * max(ltc_fresnel.x, 0.0) + (f90 - f0) * max(ltc_fresnel.y, 0.0);
+#endif
+
+#if defined(LIGHT_CODE_USED) && defined(AREA_LIGHT_CODE_USED)
+	// Light is written by the user shader. Line lights reuse the area light
+	// contract: the integral is done here, the shader only modulates it.
+	highp mat4 model_matrix = world_transform;
+	mat4 projection_matrix = scene_data_block.data.projection_matrix;
+	mat4 inv_projection_matrix = scene_data_block.data.inv_projection_matrix;
+
+	vec3 light = closest_point / max(length(closest_point), 1e-6);
+	vec3 view = eye_vec;
+
+	bool is_area = true;
+	vec3 area_diffuse = vec3(ltc_diffuse);
+	vec3 area_specular = ltc_specular * fresnel_color;
+	float attenuation = light_attenuation_ltc;
+	float specular_amount = line_lights[idx].specular_amount;
+
+	/* clang-format off */
+
+#CODE : LIGHT
+
+	/* clang-format on */
+
+#else
+	float specular_amount = line_lights[idx].specular_amount;
+	float segment_length = sqrt(length_sq);
+	float cc_attenuation = 1.0;
+
+#if defined(LIGHT_BACKLIGHT_USED) || defined(LIGHT_RIM_USED) || defined(DIFFUSE_TOON) || defined(SPECULAR_TOON)
+	// Unclamped measure, the line counterpart of the quad solid angle.
+	float measure = line_measure(p1, p2, min_radius);
+#endif
+
+#if defined(LIGHT_CLEARCOAT_USED)
+	{
+		float cc_specular_ltc = 0.0;
+		vec2 cc_fresnel;
+		ltc_evaluate_line_specular(vertex_normal, eye_vec, sqrt(mix(0.001, 0.1, clearcoat_roughness)), p1, p2, min_radius, ltc_lut1, ltc_lut2, cc_specular_ltc, cc_fresnel);
+		float Fr = (0.04 * max(cc_fresnel.x, 0.0) + (1.0 - 0.04) * max(cc_fresnel.y, 0.0)) * clearcoat;
+		cc_attenuation = 1.0 - Fr;
+		specular_light += cc_specular_ltc * Fr * light_color * light_attenuation_ltc * specular_amount;
+	}
+#endif // LIGHT_CLEARCOAT_USED
+
+	if (metallic < 1.0) {
+#if defined(DIFFUSE_TOON)
+		float NdotL = (ltc_diffuse - line_integrate_diffuse(p1, p2, -normal, min_radius)) / max(measure / M_PI, 0.001);
+		float diffuse_brdf_NL = smoothstep(-roughness, max(roughness, 0.01), NdotL) * (1.0 / M_PI);
+		diffuse_light += diffuse_brdf_NL * light_color * segment_length * light_attenuation * cc_attenuation;
+#else
+		diffuse_light += ltc_diffuse * light_color * light_attenuation_ltc * cc_attenuation;
+#endif // DIFFUSE_TOON
+
+#if defined(LIGHT_BACKLIGHT_USED)
+		diffuse_light += light_color * max(measure / M_PI - ltc_diffuse, 0.0) * backlight * light_attenuation_ltc;
+#endif
+	}
+
+#if defined(LIGHT_RIM_USED)
+	float cNdotV = max(dot(normal, eye_vec), 1e-4);
+	float rim_light = pow(max(1e-4, 1.0 - cNdotV), max(0.0, (1.0 - roughness) * 16.0));
+	diffuse_light += rim_light * rim * mix(vec3(1.0), albedo, rim_tint) * light_color * measure * light_attenuation_ltc;
+#endif
+
+#if defined(SPECULAR_TOON)
+	float mid = 1.0 - roughness;
+	mid *= mid;
+
+	float RdotV = ltc_specular / max(measure / M_PI, 0.001);
+	float intensity = smoothstep(mid - roughness * 0.5, mid + roughness * 0.5, RdotV) * mid;
+	diffuse_light += intensity * light_color * segment_length * light_attenuation * specular_amount; // write to diffuse_light, as in toon shading you generally want no reflection
+#elif defined(SPECULAR_DISABLED)
+	// do nothing
+#else
+	specular_light += ltc_specular * light_color * fresnel_color * specular_amount * light_attenuation_ltc * cc_attenuation;
+#endif // SPECULAR_TOON
+#endif // LIGHT_CODE_USED
+}
+#endif // !DISABLE_LIGHT_LINE
+
 #if !defined(DISABLE_LIGHT_SPOT) || defined(ADDITIVE_SPOT)
 void light_process_spot(uint idx, vec3 vertex, vec3 eye_vec, vec3 normal, vec3 f0, float roughness, float metallic, float shadow, vec3 albedo, inout float alpha, vec2 screen_uv,
 #ifdef LIGHT_BACKLIGHT_USED
@@ -2013,7 +2168,7 @@ void light_process_spot(uint idx, vec3 vertex, vec3 eye_vec, vec3 normal, vec3 f
 }
 #endif // !defined(DISABLE_LIGHT_SPOT) || defined(ADDITIVE_SPOT)
 
-#endif // !defined(DISABLE_LIGHT_DIRECTIONAL) || !defined(DISABLE_LIGHT_OMNI) || !defined(DISABLE_LIGHT_SPOT)
+#endif // !defined(DISABLE_LIGHT_DIRECTIONAL) || !defined(DISABLE_LIGHT_OMNI) || !defined(DISABLE_LIGHT_SPOT) || !defined(DISABLE_LIGHT_AREA) || !defined(DISABLE_LIGHT_LINE) || defined(USE_ADDITIVE_LIGHTING) || defined(USE_SH_LIGHTMAP)
 #endif // !USE_VERTEX_LIGHTING
 
 vec4 fog_process(vec3 vertex) {
@@ -2887,6 +3042,27 @@ void main() {
 				diffuse_light, specular_light);
 	}
 #endif // !DISABLE_LIGHT_AREA
+
+#ifndef DISABLE_LIGHT_LINE
+	for (uint i = 0u; i < MAX_FORWARD_LIGHTS; i++) {
+		if (i >= line_light_count) {
+			break;
+		}
+
+		light_process_line(line_light_indices[i], vertex, view, normal, f0, roughness, metallic, albedo, alpha, screen_uv,
+#ifdef LIGHT_BACKLIGHT_USED
+				backlight,
+#endif
+#ifdef LIGHT_RIM_USED
+				rim,
+				rim_tint,
+#endif
+#ifdef LIGHT_CLEARCOAT_USED
+				clearcoat, clearcoat_roughness, geo_normal,
+#endif // LIGHT_CLEARCOAT_USED
+				diffuse_light, specular_light);
+	}
+#endif // !DISABLE_LIGHT_LINE
 
 #endif // !USE_VERTEX_LIGHTING
 #endif // BASE_PASS

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="LineLight3D" inherits="Light3D" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../class.xsd">
+	<brief_description>
+		A line light, such as a thin neon tube or a strip light.
+	</brief_description>
+	<description>
+		A line light is a type of [Light3D] node that emits light from a finite line segment of zero thickness, rather than from a single point. The segment lies along the local X axis and is centered on the node's origin, so its endpoints are at [code]-line_length / 2[/code] and [code]+line_length / 2[/code]. The light is attenuated throughout the distance; this attenuation can be configured by changing the energy, [member line_attenuation] and [member line_range].
+		Unlike an [OmniLight3D], a line light emits like a cylinder: it is brightest when seen broadside and fades to nothing when seen end-on. This also makes its specular highlight a streak along the segment rather than a dot, which is what gives tube lights their characteristic look on glossy surfaces.
+		Diffuse lighting uses the exact analytic integral of the Lambertian term over the segment. Specular lighting uses Linearly Transformed Cosines (LTC), so the highlight stays correct for any roughness without approximating the light as a row of point lights.
+		[b]Note:[/b] Line lights do not cast shadows and are not supported by any GI method ([VoxelGI], [LightmapGI] or SDFGI) or by volumetric fog. The related properties are therefore hidden in the inspector.
+		[b]Performance:[/b] Line lights are more demanding on the GPU than omni and spot lights, as each one evaluates an analytic integral per pixel. In Forward+, there is an additional GPU cost on [i]all[/i] rendered objects as soon as one line light is present in the view frustum (due to the nature of clustered lighting).
+	</description>
+	<tutorials>
+		<link title="3D lights and shadows">$DOCS_URL/tutorials/3d/lights_and_shadows.html</link>
+	</tutorials>
+	<members>
+		<member name="line_attenuation" type="float" setter="set_param" getter="get_param" default="1.0">
+			Controls the distance attenuation function for this line light.
+			A value of [code]0.0[/code] will maintain a constant brightness through most of the range, but will smoothly attenuate the light at the edge of the range. Use a value of [code]2.0[/code] for physically accurate lights as it results in the proper inverse square attenuation.
+			[b]Note:[/b] Using negative values or values higher than [code]10.0[/code] may lead to unexpected results.
+		</member>
+		<member name="line_length" type="float" setter="set_line_length" getter="get_line_length" default="1.0">
+			The length of the segment in meters, measured along the node's local X axis. A length of [code]0.0[/code] emits no light.
+		</member>
+		<member name="line_normalize_energy" type="bool" setter="set_line_normalize_energy" getter="is_line_normalizing_energy" default="true">
+			Defines whether the energy is normalized (divided) by the length of the segment. If set to [code]true[/code], changing the length does not affect the total energy output, and does not dramatically alter the brightness of the scene. With this enabled, a short line light seen broadside matches an [OmniLight3D] of the same energy.
+		</member>
+		<member name="line_radius" type="float" setter="set_param" getter="get_param" default="0.01">
+			The radius used to regularize the segment, in meters. A segment of zero thickness is mathematically singular where a surface touches it, which would produce infinitely bright pixels. Shading is therefore computed as if the surface were never closer to the segment than this distance, which behaves like giving the light a small tube radius.
+			Raising this value softens the light where geometry comes very close to the segment. It does [i]not[/i] control shadow softness, as line lights cast no shadows.
+		</member>
+		<member name="line_range" type="float" setter="set_param" getter="get_param" default="5.0">
+			The range of the line light in meters. This determines the maximum distance from any point on the segment at which the light can still be seen.
+		</member>
+	</members>
+</class>

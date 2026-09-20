@@ -88,9 +88,11 @@ void RasterizerSceneGLES3::GeometryInstanceGLES3::clear_light_instances() {
 	paired_omni_light_count = 0;
 	paired_spot_light_count = 0;
 	paired_area_light_count = 0;
+	paired_line_light_count = 0;
 	paired_omni_lights.clear();
 	paired_spot_lights.clear();
 	paired_area_lights.clear();
+	paired_line_lights.clear();
 }
 
 void RasterizerSceneGLES3::GeometryInstanceGLES3::pair_light_instance(
@@ -119,6 +121,14 @@ void RasterizerSceneGLES3::GeometryInstanceGLES3::pair_light_instance(
 					++paired_area_light_count;
 				} else {
 					paired_area_lights[placement_idx] = p_light_instance;
+				}
+			} break;
+			case RSE::LIGHT_LINE: {
+				if (placement_idx >= paired_line_light_count) {
+					paired_line_lights.push_back(p_light_instance);
+					++paired_line_light_count;
+				} else {
+					paired_line_lights[placement_idx] = p_light_instance;
 				}
 			} break;
 			default:
@@ -1366,6 +1376,7 @@ void RasterizerSceneGLES3::_fill_render_list(RenderListType p_render_list, const
 			inst->spot_light_gl_cache.clear();
 			inst->omni_light_gl_cache.clear();
 			inst->area_light_gl_cache.clear();
+			inst->line_light_gl_cache.clear();
 			inst->reflection_probes_local_transform_cache.clear();
 			inst->reflection_probe_rid_cache.clear();
 			uint64_t current_frame = RSG::rasterizer->get_frame_number();
@@ -1429,6 +1440,17 @@ void RasterizerSceneGLES3::_fill_render_list(RenderListType p_render_list, const
 						// Lights without shadow can all go in base pass.
 						inst->area_light_gl_cache.push_back((uint32_t)light_storage->light_instance_get_gl_id(light_instance));
 					}
+				}
+			}
+
+			if (inst->paired_line_light_count) {
+				for (uint32_t j = 0; j < inst->paired_line_light_count; j++) {
+					RID light_instance = inst->paired_line_lights[j];
+					if (light_storage->light_instance_get_render_pass(light_instance) != current_frame) {
+						continue;
+					}
+					// Line lights never have shadows, so they always go in the base pass.
+					inst->line_light_gl_cache.push_back((uint32_t)light_storage->light_instance_get_gl_id(light_instance));
 				}
 			}
 
@@ -1722,7 +1744,7 @@ void RasterizerSceneGLES3::_setup_environment(const RenderDataGLES3 *p_render_da
 }
 
 // Puts lights into Uniform Buffers. Needs to be called before _fill_list as this caches the index of each light in the Uniform Buffer
-void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, bool p_using_shadows, uint32_t &r_directional_light_count, uint32_t &r_omni_light_count, uint32_t &r_spot_light_count, uint32_t &r_area_light_count, uint32_t &r_directional_shadow_count) {
+void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, bool p_using_shadows, uint32_t &r_directional_light_count, uint32_t &r_omni_light_count, uint32_t &r_spot_light_count, uint32_t &r_area_light_count, uint32_t &r_line_light_count, uint32_t &r_directional_shadow_count) {
 	GLES3::LightStorage *light_storage = GLES3::LightStorage::get_singleton();
 	GLES3::Config *config = GLES3::Config::get_singleton();
 
@@ -1734,6 +1756,7 @@ void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, b
 	r_omni_light_count = 0;
 	r_spot_light_count = 0;
 	r_area_light_count = 0;
+	r_line_light_count = 0;
 	r_directional_shadow_count = 0;
 
 	int num_lights = lights.size();
@@ -1916,6 +1939,29 @@ void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, b
 				scene_state.area_light_sort[r_area_light_count].depth = distance;
 				r_area_light_count++;
 			} break;
+			case RSE::LIGHT_LINE: {
+				if (r_line_light_count >= (uint32_t)config->max_renderable_lights) {
+					continue;
+				}
+
+				const real_t distance = p_render_data->cam_transform.origin.distance_to(li->transform.origin);
+
+				if (light_storage->light_is_distance_fade_enabled(li->light)) {
+					const float fade_begin = light_storage->light_get_distance_fade_begin(li->light);
+					const float fade_length = light_storage->light_get_distance_fade_length(li->light);
+
+					if (distance > fade_begin) {
+						if (distance > fade_begin + fade_length) {
+							// Out of range, don't draw this light to improve performance.
+							continue;
+						}
+					}
+				}
+
+				scene_state.line_light_sort[r_line_light_count].instance = li;
+				scene_state.line_light_sort[r_line_light_count].depth = distance;
+				r_line_light_count++;
+			} break;
 		}
 
 		li->last_pass = RSG::rasterizer->get_frame_number();
@@ -1936,9 +1982,14 @@ void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, b
 		sorter.sort(scene_state.area_light_sort, r_area_light_count);
 	}
 
+	if (r_line_light_count) {
+		SortArray<InstanceSort<GLES3::LightInstance>> sorter;
+		sorter.sort(scene_state.line_light_sort, r_line_light_count);
+	}
+
 	int num_positional_shadows = 0;
 
-	for (uint32_t i = 0; i < (r_omni_light_count + r_spot_light_count + r_area_light_count); i++) {
+	for (uint32_t i = 0; i < (r_omni_light_count + r_spot_light_count + r_area_light_count + r_line_light_count); i++) {
 		uint32_t index;
 		LightData *light_data_ptr;
 		RSE::LightType type;
@@ -1957,12 +2008,18 @@ void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, b
 			type = RSE::LIGHT_SPOT;
 			li = scene_state.spot_light_sort[index].instance;
 			distance = scene_state.spot_light_sort[index].depth;
-		} else { // area light
+		} else if (i < r_omni_light_count + r_spot_light_count + r_area_light_count) {
 			index = i - r_omni_light_count - r_spot_light_count;
 			light_data_ptr = &scene_state.area_lights[index];
 			type = RSE::LIGHT_AREA;
 			li = scene_state.area_light_sort[index].instance;
 			distance = scene_state.area_light_sort[index].depth;
+		} else { // line light
+			index = i - r_omni_light_count - r_spot_light_count - r_area_light_count;
+			light_data_ptr = &scene_state.line_lights[index];
+			type = RSE::LIGHT_LINE;
+			li = scene_state.line_light_sort[index].instance;
+			distance = scene_state.line_light_sort[index].depth;
 		}
 		LightData &light_data = *light_data_ptr;
 		GLES3::Light *light = light_storage->get_light(li->light);
@@ -2026,7 +2083,7 @@ void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, b
 			energy *= light_storage->light_get_param(base, RSE::LIGHT_PARAM_INTENSITY);
 
 			// Convert from Luminous Power to Luminous Intensity
-			if (type == RSE::LIGHT_OMNI) {
+			if (type == RSE::LIGHT_OMNI || type == RSE::LIGHT_LINE) {
 				energy *= 1.0 / (Math::PI * 4.0);
 			} else if (type == RSE::LIGHT_AREA) {
 				energy *= 1.0 / (Math::PI * 2.0);
@@ -2075,6 +2132,30 @@ void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, b
 				light_data.color[0] /= surface_area;
 				light_data.color[1] /= surface_area;
 				light_data.color[2] /= surface_area;
+			}
+		} else if (type == RSE::LIGHT_LINE) {
+			// The segment lies along the light's local X axis, centered on its origin.
+			// `area_width` carries the full segment vector; `area_height` is unused.
+			float length = light->line_length;
+			Vector3 segment = inverse_transform.basis.xform(light_transform.basis.xform(Vector3(1, 0, 0))).normalized() * length;
+
+			light_data.area_width[0] = segment.x;
+			light_data.area_width[1] = segment.y;
+			light_data.area_width[2] = segment.z;
+
+			light_data.area_height[0] = 0.0;
+			light_data.area_height[1] = 0.0;
+			light_data.area_height[2] = 0.0;
+			// Spot-only fields; keep sane values out of the shared buffer.
+			light_data.inv_spot_attenuation = 0.0;
+			light_data.cos_spot_angle = 0.0;
+
+			if (light->area_normalize_energy && length > 0.0) {
+				// Keep total output independent of length, so that a short broadside
+				// line matches an omni light of the same energy.
+				light_data.color[0] /= length;
+				light_data.color[1] /= length;
+				light_data.color[2] /= length;
 			}
 		}
 
@@ -2132,6 +2213,8 @@ void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, b
 
 				GLES3::MaterialStorage::store_transform(proj, shadow_data.shadow_matrix);
 			}
+		} else {
+			light_data.shadow_opacity = 0.0;
 		}
 	}
 
@@ -2145,6 +2228,11 @@ void RasterizerSceneGLES3::_setup_lights(const RenderDataGLES3 *p_render_data, b
 	glBindBufferBase(GL_UNIFORM_BUFFER, SCENE_SPOTLIGHT_UNIFORM_LOCATION, scene_state.spot_light_buffer);
 	if (r_spot_light_count) {
 		glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(LightData) * r_spot_light_count, scene_state.spot_lights);
+	}
+
+	glBindBufferBase(GL_UNIFORM_BUFFER, SCENE_LINELIGHT_UNIFORM_LOCATION, scene_state.line_light_buffer);
+	if (r_line_light_count) {
+		glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(LightData) * r_line_light_count, scene_state.line_lights);
 	}
 
 	glBindBufferBase(GL_UNIFORM_BUFFER, SCENE_AREALIGHT_UNIFORM_LOCATION, scene_state.area_light_buffer);
@@ -2394,6 +2482,7 @@ void RasterizerSceneGLES3::_render_shadow_pass(RID p_light, RID p_shadow_atlas, 
 			SceneShaderGLES3::DISABLE_LIGHT_DIRECTIONAL |
 			SceneShaderGLES3::DISABLE_LIGHT_OMNI |
 			SceneShaderGLES3::DISABLE_LIGHT_AREA |
+			SceneShaderGLES3::DISABLE_LIGHT_LINE |
 			SceneShaderGLES3::DISABLE_LIGHT_SPOT |
 			SceneShaderGLES3::DISABLE_FOG |
 			SceneShaderGLES3::RENDER_SHADOWS;
@@ -2594,7 +2683,7 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
 
 	texture_storage->update_decal_buffer(p_decals, render_data.cam_transform);
 
-	_setup_lights(&render_data, true, render_data.directional_light_count, render_data.omni_light_count, render_data.spot_light_count, render_data.area_light_count, render_data.directional_shadow_count);
+	_setup_lights(&render_data, true, render_data.directional_light_count, render_data.omni_light_count, render_data.spot_light_count, render_data.area_light_count, render_data.line_light_count, render_data.directional_shadow_count);
 	_setup_environment(&render_data, is_reflection_probe, screen_size, flip_y, clear_color, false);
 
 	_fill_render_list(RENDER_LIST_OPAQUE, &render_data, PASS_MODE_COLOR);
@@ -2776,7 +2865,8 @@ void RasterizerSceneGLES3::render_scene(const Ref<RenderSceneBuffers> &p_render_
 
 		uint64_t spec_constant = SceneShaderGLES3::DISABLE_FOG | SceneShaderGLES3::DISABLE_LIGHT_DIRECTIONAL |
 				SceneShaderGLES3::DISABLE_LIGHTMAP | SceneShaderGLES3::DISABLE_LIGHT_OMNI |
-				SceneShaderGLES3::DISABLE_LIGHT_SPOT | SceneShaderGLES3::DISABLE_LIGHT_AREA;
+				SceneShaderGLES3::DISABLE_LIGHT_SPOT | SceneShaderGLES3::DISABLE_LIGHT_AREA |
+				SceneShaderGLES3::DISABLE_LIGHT_LINE;
 
 		RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, spec_constant, use_wireframe);
 		_render_list_template<PASS_MODE_DEPTH>(&render_list_params, &render_data, 0, render_list[RENDER_LIST_OPAQUE].elements.size());
@@ -3589,6 +3679,7 @@ void RasterizerSceneGLES3::_render_list_template(RenderListParameters *p_params,
 						spec_constants |= SceneShaderGLES3::DISABLE_LIGHT_OMNI;
 						spec_constants |= SceneShaderGLES3::DISABLE_LIGHT_SPOT;
 						spec_constants |= SceneShaderGLES3::DISABLE_LIGHT_AREA;
+						spec_constants |= SceneShaderGLES3::DISABLE_LIGHT_LINE;
 						spec_constants |= SceneShaderGLES3::DISABLE_LIGHT_DIRECTIONAL;
 						spec_constants |= SceneShaderGLES3::DISABLE_LIGHTMAP;
 					} else {
@@ -3602,6 +3693,10 @@ void RasterizerSceneGLES3::_render_list_template(RenderListParameters *p_params,
 
 						if (inst->area_light_gl_cache.is_empty()) {
 							spec_constants |= SceneShaderGLES3::DISABLE_LIGHT_AREA;
+						}
+
+						if (inst->line_light_gl_cache.is_empty()) {
+							spec_constants |= SceneShaderGLES3::DISABLE_LIGHT_LINE;
 						}
 
 						if (p_render_data->directional_light_count == p_render_data->directional_shadow_count) {
@@ -3656,6 +3751,7 @@ void RasterizerSceneGLES3::_render_list_template(RenderListParameters *p_params,
 					spec_constants |= SceneShaderGLES3::DISABLE_LIGHT_OMNI;
 					spec_constants |= SceneShaderGLES3::DISABLE_LIGHT_SPOT;
 					spec_constants |= SceneShaderGLES3::DISABLE_LIGHT_AREA;
+					spec_constants |= SceneShaderGLES3::DISABLE_LIGHT_LINE;
 					spec_constants |= SceneShaderGLES3::DISABLE_LIGHT_DIRECTIONAL;
 					spec_constants |= SceneShaderGLES3::DISABLE_REFLECTION_PROBE;
 
@@ -3819,6 +3915,7 @@ void RasterizerSceneGLES3::_render_list_template(RenderListParameters *p_params,
 					material_storage->shaders.scene_shader.version_set_uniform(SceneShaderGLES3::OMNI_LIGHT_COUNT, inst->omni_light_gl_cache.size(), shader->version, instance_variant, spec_constants);
 					material_storage->shaders.scene_shader.version_set_uniform(SceneShaderGLES3::SPOT_LIGHT_COUNT, inst->spot_light_gl_cache.size(), shader->version, instance_variant, spec_constants);
 					material_storage->shaders.scene_shader.version_set_uniform(SceneShaderGLES3::AREA_LIGHT_COUNT, inst->area_light_gl_cache.size(), shader->version, instance_variant, spec_constants);
+					material_storage->shaders.scene_shader.version_set_uniform(SceneShaderGLES3::LINE_LIGHT_COUNT, inst->line_light_gl_cache.size(), shader->version, instance_variant, spec_constants);
 
 					if (inst->omni_light_gl_cache.size()) {
 						glUniform1uiv(material_storage->shaders.scene_shader.version_get_uniform(SceneShaderGLES3::OMNI_LIGHT_INDICES, shader->version, instance_variant, spec_constants), inst->omni_light_gl_cache.size(), inst->omni_light_gl_cache.ptr());
@@ -3830,6 +3927,10 @@ void RasterizerSceneGLES3::_render_list_template(RenderListParameters *p_params,
 
 					if (inst->area_light_gl_cache.size()) {
 						glUniform1uiv(material_storage->shaders.scene_shader.version_get_uniform(SceneShaderGLES3::AREA_LIGHT_INDICES, shader->version, instance_variant, spec_constants), inst->area_light_gl_cache.size(), inst->area_light_gl_cache.ptr());
+					}
+
+					if (inst->line_light_gl_cache.size()) {
+						glUniform1uiv(material_storage->shaders.scene_shader.version_get_uniform(SceneShaderGLES3::LINE_LIGHT_INDICES, shader->version, instance_variant, spec_constants), inst->line_light_gl_cache.size(), inst->line_light_gl_cache.ptr());
 					}
 
 					if (inst->lightmap_instance.is_valid()) {
@@ -4242,6 +4343,7 @@ void RasterizerSceneGLES3::_render_uv2(const PagedArray<RenderGeometryInstance *
 		base_spec_constant |= SceneShaderGLES3::DISABLE_LIGHT_OMNI;
 		base_spec_constant |= SceneShaderGLES3::DISABLE_LIGHT_SPOT;
 		base_spec_constant |= SceneShaderGLES3::DISABLE_LIGHT_AREA;
+		base_spec_constant |= SceneShaderGLES3::DISABLE_LIGHT_LINE;
 		base_spec_constant |= SceneShaderGLES3::DISABLE_LIGHTMAP;
 
 		RenderListParameters render_list_params(render_list[RENDER_LIST_SECONDARY].elements.ptr(), render_list[RENDER_LIST_SECONDARY].elements.size(), false, base_spec_constant, true, Vector2(0, 0));
@@ -4664,6 +4766,12 @@ RasterizerSceneGLES3::RasterizerSceneGLES3() {
 		glBindBuffer(GL_UNIFORM_BUFFER, scene_state.area_light_buffer);
 		GLES3::Utilities::get_singleton()->buffer_allocate_data(GL_UNIFORM_BUFFER, scene_state.area_light_buffer, light_buffer_size, nullptr, GL_STREAM_DRAW, "AreaLight UBO");
 
+		scene_state.line_lights = memnew_arr(LightData, config->max_renderable_lights);
+		scene_state.line_light_sort = memnew_arr(InstanceSort<GLES3::LightInstance>, config->max_renderable_lights);
+		glGenBuffers(1, &scene_state.line_light_buffer);
+		glBindBuffer(GL_UNIFORM_BUFFER, scene_state.line_light_buffer);
+		GLES3::Utilities::get_singleton()->buffer_allocate_data(GL_UNIFORM_BUFFER, scene_state.line_light_buffer, light_buffer_size, nullptr, GL_STREAM_DRAW, "LineLight UBO");
+
 		uint32_t directional_light_buffer_size = MAX_DIRECTIONAL_LIGHTS * sizeof(DirectionalLightData);
 		scene_state.directional_lights = memnew_arr(DirectionalLightData, MAX_DIRECTIONAL_LIGHTS);
 		glGenBuffers(1, &scene_state.directional_light_buffer);
@@ -4861,15 +4969,18 @@ RasterizerSceneGLES3::~RasterizerSceneGLES3() {
 	GLES3::Utilities::get_singleton()->buffer_free_data(scene_state.omni_light_buffer);
 	GLES3::Utilities::get_singleton()->buffer_free_data(scene_state.spot_light_buffer);
 	GLES3::Utilities::get_singleton()->buffer_free_data(scene_state.area_light_buffer);
+	GLES3::Utilities::get_singleton()->buffer_free_data(scene_state.line_light_buffer);
 	GLES3::Utilities::get_singleton()->buffer_free_data(scene_state.positional_shadow_buffer);
 	GLES3::Utilities::get_singleton()->buffer_free_data(scene_state.directional_shadow_buffer);
 	memdelete_arr(scene_state.directional_lights);
 	memdelete_arr(scene_state.omni_lights);
 	memdelete_arr(scene_state.spot_lights);
 	memdelete_arr(scene_state.area_lights);
+	memdelete_arr(scene_state.line_lights);
 	memdelete_arr(scene_state.omni_light_sort);
 	memdelete_arr(scene_state.spot_light_sort);
 	memdelete_arr(scene_state.area_light_sort);
+	memdelete_arr(scene_state.line_light_sort);
 	memdelete_arr(scene_state.positional_shadows);
 	memdelete_arr(scene_state.directional_shadows);
 

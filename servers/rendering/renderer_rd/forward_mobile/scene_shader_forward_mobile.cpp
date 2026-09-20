@@ -295,6 +295,7 @@ void SceneShaderForwardMobile::ShaderData::_create_pipeline(PipelineKey p_pipeli
 			"SPEC PACKED #0:", p_pipeline_key.shader_specialization.packed_0,
 			"SPEC PACKED #1:", p_pipeline_key.shader_specialization.packed_1,
 			"SPEC PACKED #2:", p_pipeline_key.shader_specialization.packed_2,
+			"SPEC PACKED #3:", p_pipeline_key.shader_specialization.packed_3,
 			"RENDER PASS:", p_pipeline_key.render_pass,
 			"WIREFRAME:", p_pipeline_key.wireframe);
 #endif
@@ -445,6 +446,11 @@ void SceneShaderForwardMobile::ShaderData::_create_pipeline(PipelineKey p_pipeli
 	sc.constant_id = 3;
 	sc.bool_value = emulate_point_size_flag;
 	sc.type = RD::PIPELINE_SPECIALIZATION_CONSTANT_TYPE_BOOL;
+	specialization_constants.push_back(sc);
+
+	sc.constant_id = 4;
+	sc.int_value = p_pipeline_key.shader_specialization.packed_3;
+	sc.type = RD::PIPELINE_SPECIALIZATION_CONSTANT_TYPE_INT;
 	specialization_constants.push_back(sc);
 
 	RID shader_rid = get_shader_variant(p_pipeline_key.version, p_pipeline_key.ubershader);

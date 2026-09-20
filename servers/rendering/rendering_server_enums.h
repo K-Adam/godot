@@ -243,6 +243,7 @@ enum LightType {
 	LIGHT_OMNI,
 	LIGHT_SPOT,
 	LIGHT_AREA,
+	LIGHT_LINE,
 };
 
 enum LightParam {

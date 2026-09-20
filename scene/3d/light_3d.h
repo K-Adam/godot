@@ -270,3 +270,24 @@ public:
 	AreaLight3D();
 	~AreaLight3D();
 };
+
+class LineLight3D : public Light3D {
+	GDCLASS(LineLight3D, Light3D);
+
+private:
+	float line_length = 1.0;
+	bool line_normalize_energy = true;
+
+protected:
+	static void _bind_methods();
+	void _validate_property(PropertyInfo &p_property) const;
+
+public:
+	void set_line_length(float p_length);
+	float get_line_length() const;
+
+	void set_line_normalize_energy(bool p_enable);
+	bool is_line_normalizing_energy() const;
+
+	LineLight3D();
+};

@@ -1431,6 +1431,8 @@ void RenderForwardClustered::setup_added_light(const RSE::LightType p_type, cons
 			type = ClusterBuilderRD::LIGHT_TYPE_SPOT;
 		} else if (p_type == RSE::LIGHT_OMNI) {
 			type = ClusterBuilderRD::LIGHT_TYPE_OMNI;
+		} else if (p_type == RSE::LIGHT_LINE) {
+			type = ClusterBuilderRD::LIGHT_TYPE_LINE;
 		} else {
 			type = ClusterBuilderRD::LIGHT_TYPE_AREA;
 		}
@@ -2269,6 +2271,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	if (current_cluster_builder) {
 		base_specialization.cluster_has_area_light = current_cluster_builder->get_cluster_count_by_type(ClusterBuilderRD::ELEMENT_TYPE_AREA_LIGHT) != 0;
+		base_specialization.cluster_has_line_light = current_cluster_builder->get_cluster_count_by_type(ClusterBuilderRD::ELEMENT_TYPE_LINE_LIGHT) != 0;
 	}
 
 	RENDER_TIMESTAMP("Render Opaque Pass");
@@ -3455,6 +3458,14 @@ void RenderForwardClustered::_update_render_base_uniform_set() {
 			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 			RID area_light_atlas = RendererRD::TextureStorage::get_singleton()->area_light_atlas_get_texture();
 			u.append_id(area_light_atlas);
+			uniforms.push_back(u);
+		}
+
+		{
+			RD::Uniform u;
+			u.binding = 21;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.append_id(RendererRD::LightStorage::get_singleton()->get_line_light_buffer());
 			uniforms.push_back(u);
 		}
 

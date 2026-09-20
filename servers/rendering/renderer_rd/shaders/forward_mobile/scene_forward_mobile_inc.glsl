@@ -22,6 +22,7 @@ layout(push_constant, std430) uniform DrawCall {
 	uint sc_packed_0;
 	uint sc_packed_1;
 	float sc_packed_2;
+	uint sc_packed_3;
 	uint uc_packed_0;
 #endif
 }
@@ -48,6 +49,10 @@ float sc_packed_2() {
 	return draw_call.sc_packed_2;
 }
 
+uint sc_packed_3() {
+	return draw_call.sc_packed_3;
+}
+
 uint uc_cull_mode() {
 	return (draw_call.uc_packed_0 >> 0) & 3U;
 }
@@ -58,6 +63,7 @@ uint uc_cull_mode() {
 layout(constant_id = 0) const uint pso_sc_packed_0 = 0;
 layout(constant_id = 1) const uint pso_sc_packed_1 = 0;
 layout(constant_id = 2) const float pso_sc_packed_2 = 2.0;
+layout(constant_id = 4) const uint pso_sc_packed_3 = 0;
 
 uint sc_packed_0() {
 	return pso_sc_packed_0;
@@ -69,6 +75,10 @@ uint sc_packed_1() {
 
 float sc_packed_2() {
 	return pso_sc_packed_2;
+}
+
+uint sc_packed_3() {
+	return pso_sc_packed_3;
 }
 
 #endif
@@ -196,6 +206,11 @@ uint sc_spot_lights(uint bound) {
 
 uint sc_area_lights(uint bound) {
 	uint option = (sc_packed_1() >> 16) & 3U;
+	return option_to_count(option, bound);
+}
+
+uint sc_line_lights(uint bound) {
+	uint option = (sc_packed_3() >> 0) & 3U;
 	return option_to_count(option, bound);
 }
 
@@ -341,6 +356,11 @@ layout(set = 0, binding = 16) uniform texture2D ltc_lut2;
 
 layout(set = 0, binding = 17) uniform texture2D area_light_atlas;
 
+layout(set = 0, binding = 18, std430) restrict readonly buffer LineLights {
+	LightData data[];
+}
+line_lights;
+
 /* Set 1: Render Pass (changes per render pass) */
 
 layout(set = 1, binding = 0, std140) uniform SceneDataBlock {
@@ -367,7 +387,7 @@ struct InstanceData {
 	uvec2 spot_lights;
 	uvec2 area_lights;
 	uvec2 decals;
-	uvec2 padding;
+	uvec2 line_lights;
 #ifdef USE_DOUBLE_PRECISION
 	vec4 model_precision;
 	vec4 prev_model_precision;

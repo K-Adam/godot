@@ -154,6 +154,10 @@ bool sc_material_feedback() {
 	return ((sc_packed_1() >> 7) & 1U) != 0;
 }
 
+bool sc_cluster_has_line_light() {
+	return ((sc_packed_1() >> 8) & 1U) != 0;
+}
+
 float sc_luminance_multiplier() {
 	// Not used in clustered renderer but we share some code with the mobile renderer that requires this.
 	return 1.0;
@@ -318,6 +322,11 @@ layout(set = 0, binding = 18) uniform texture2D ltc_lut1;
 layout(set = 0, binding = 19) uniform texture2D ltc_lut2;
 
 layout(set = 0, binding = 20) uniform texture2D area_light_atlas;
+
+layout(set = 0, binding = 21, std430) restrict readonly buffer LineLights {
+	LightData data[];
+}
+line_lights;
 /* Set 1: Render Pass (changes per render pass) */
 
 layout(set = 1, binding = 0, std140) uniform SceneDataBlock {

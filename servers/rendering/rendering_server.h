@@ -315,6 +315,7 @@ public:
 	virtual RID omni_light_create() = 0;
 	virtual RID spot_light_create() = 0;
 	virtual RID area_light_create() = 0;
+	virtual RID line_light_create() = 0;
 
 	virtual void light_set_color(RID p_light, const Color &p_color) = 0;
 	virtual void light_set_param(RID p_light, RSE::LightParam p_param, float p_value) = 0;
@@ -343,6 +344,11 @@ public:
 	virtual void light_area_set_size(RID p_light, const Vector2 &p_size) = 0;
 	virtual void light_area_set_normalize_energy(RID p_light, bool p_enabled) = 0;
 	virtual void light_area_set_texture(RID p_light, RID texture) = 0;
+
+	// Line light
+
+	virtual void light_line_set_length(RID p_light, float p_length) = 0;
+	virtual void light_line_set_normalize_energy(RID p_light, bool p_enabled) = 0;
 
 	// Shadow atlas
 

@@ -496,7 +496,8 @@ void ClusterBuilderRD::bake_cluster() {
 							RD::get_singleton()->draw_list_bind_index_array(draw_list, shared->cone_index_array);
 						}
 					} break;
-					case ELEMENT_TYPE_AREA_LIGHT: {
+					case ELEMENT_TYPE_AREA_LIGHT:
+					case ELEMENT_TYPE_LINE_LIGHT: {
 						RD::get_singleton()->draw_list_bind_vertex_array(draw_list, shared->box_vertex_array);
 						RD::get_singleton()->draw_list_bind_index_array(draw_list, shared->box_index_array);
 					} break;

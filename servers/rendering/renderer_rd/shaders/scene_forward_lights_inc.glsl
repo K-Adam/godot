@@ -4,6 +4,15 @@
 
 #include "area_lights_inc.glsl"
 
+// Uncomment to shade line lights by brute-force Gauss-Legendre quadrature of the
+// actual BRDF instead of the analytic integrals. Far slower, and only meant as a
+// ground truth to validate light_process_line() against. Anisotropic materials
+// keep using the analytic path, which ignores anisotropy until the anisotropic
+// LTC tables land. Note this path regularizes the distance to each sample rather
+// than the perpendicular distance to the line, so the two necessarily diverge
+// where a surface touches the segment.
+//#define LINE_LIGHT_REFERENCE
+
 // This annotation macro must be placed before any loops that rely on specialization constants as their upper bound.
 // Drivers may choose to unroll these loops based on the possible range of the value that can be deduced from the
 // spec constant, which can lead to their code generation taking a much longer time than desired.
@@ -1307,6 +1316,238 @@ void light_process_area(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 #else
 	hvec3 spec = half(ltc_specular) * hvec3(ltc_specular_tex_color) * color * fresnel_color;
 	specular_light += spec * specular_amount * light_attenuation_ltc * cc_attenuation;
+#endif // SPECULAR_TOON
+
+#endif // LIGHT_CODE_USED
+}
+
+// Finite zero-thickness line light. Diffuse uses the exact Lambertian line
+// integral; specular uses the same integral under the LTC transform for GGX.
+// Line lights have no shadows, no projector and no texture.
+void light_process_line(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, hvec3 f0, half roughness, half metallic, hvec3 albedo, inout half alpha, vec2 screen_uv, hvec3 energy_compensation,
+#ifdef LIGHT_BACKLIGHT_USED
+		hvec3 backlight,
+#endif
+#ifdef LIGHT_TRANSMITTANCE_USED
+		hvec4 transmittance_color,
+		half transmittance_depth,
+		half transmittance_boost,
+#endif
+#ifdef LIGHT_RIM_USED
+		half rim, half rim_tint,
+#endif
+#ifdef LIGHT_CLEARCOAT_USED
+		half clearcoat, half clearcoat_roughness, hvec3 vertex_normal,
+#endif
+		inout hvec3 diffuse_light, inout hvec3 specular_light) {
+	vec3 segment = line_lights.data[idx].area_width;
+	float length_sq = dot(segment, segment);
+	if (length_sq < 1e-12) {
+		return; // Zero-length segment emits nothing.
+	}
+
+	// Endpoints relative to the shading point.
+	vec3 half_segment = segment * 0.5;
+	vec3 light_center = line_lights.data[idx].position - vertex;
+	vec3 p1 = light_center - half_segment;
+	vec3 p2 = light_center + half_segment;
+
+	// Distance to the closest point on the segment drives the range falloff.
+	float t = clamp(dot(-p1, segment) / length_sq, 0.0, 1.0);
+	vec3 closest_point = p1 + segment * t;
+	float min_radius = max(line_lights.data[idx].size, 0.0);
+	float dist_to_segment = max(length(closest_point), min_radius);
+
+	half light_attenuation = get_omni_attenuation(dist_to_segment, line_lights.data[idx].inv_radius, line_lights.data[idx].attenuation);
+	// The line integral already falls off with the inverse square of distance, so
+	// cancel it here and keep only the artistic range window, as area lights do.
+	// This is the value that scales the result, so it is also what decides whether
+	// there is anything to do; `light_attenuation` alone would cut the light off at
+	// a fixed distance regardless of its range.
+	float attenuation_ltc = float(light_attenuation) * dist_to_segment * dist_to_segment;
+	if (attenuation_ltc < 1e-5) {
+		return;
+	}
+	half light_attenuation_ltc = half(min(attenuation_ltc, 65504.0)); // Keep in fp16 range.
+
+	hvec3 color = hvec3(line_lights.data[idx].color);
+
+#if defined(LINE_LIGHT_REFERENCE) && !defined(LIGHT_ANISOTROPY_USED)
+	// 16-point Gauss-Legendre quadrature of the real BRDF along the segment.
+	// Nodes and weights are symmetric, so only the positive half is stored.
+	const float quad_nodes[8] = float[](0.0950125098, 0.2816035508, 0.4580167777, 0.6178762444, 0.7554044084, 0.8656312024, 0.9445750231, 0.9894009350);
+	const float quad_weights[8] = float[](0.1894506105, 0.1826034150, 0.1691565194, 0.1495959888, 0.1246289713, 0.0951585117, 0.0622535239, 0.0271524594);
+
+	float seg_length = sqrt(length_sq);
+	vec3 tangent_dir = segment / seg_length;
+	float half_len = 0.5 * seg_length;
+	float min_radius_sq = min_radius * min_radius;
+
+	for (int node_i = 0; node_i < 8; node_i++) {
+		for (int node_side = 0; node_side < 2; node_side++) {
+			float node = node_side == 0 ? -quad_nodes[node_i] : quad_nodes[node_i];
+			vec3 sample_vec = light_center + tangent_dir * (node * half_len);
+			float dist_sq = max(dot(sample_vec, sample_vec), min_radius_sq);
+			vec3 sample_dir = sample_vec * inversesqrt(dist_sq);
+			// sin(phi) is the cylinder's projected width towards this sample.
+			float sin_phi = length(cross(sample_dir, tangent_dir));
+			half sample_weight = half(quad_weights[node_i] * half_len * sin_phi / dist_sq);
+
+			light_compute(normal, hvec3(sample_dir), eye_vec, half(0.0), color, false, sample_weight * light_attenuation_ltc, f0, roughness, metallic, half(line_lights.data[idx].specular_amount), albedo, alpha, screen_uv, energy_compensation,
+#ifdef LIGHT_BACKLIGHT_USED
+					backlight,
+#endif
+#ifdef LIGHT_TRANSMITTANCE_USED
+					transmittance_color,
+					transmittance_depth,
+					transmittance_boost,
+					half(0.0),
+#endif
+#ifdef LIGHT_RIM_USED
+					rim, rim_tint,
+#endif
+#ifdef LIGHT_CLEARCOAT_USED
+					clearcoat, clearcoat_roughness, vertex_normal,
+#endif
+					diffuse_light,
+					specular_light);
+		}
+	}
+	return;
+#endif // LINE_LIGHT_REFERENCE
+
+	float ltc_diffuse = line_integrate_diffuse(p1, p2, vec3(normal), min_radius);
+
+	float ltc_specular = 0.0;
+	vec2 ltc_fresnel = vec2(0.0);
+	hvec3 fresnel_color = hvec3(0.0);
+#if !defined(SPECULAR_DISABLED) || (defined(LIGHT_CODE_USED) && defined(AREA_LIGHT_CODE_USED))
+	ltc_evaluate_line_specular(vec3(normal), vec3(eye_vec), roughness, p1, p2, min_radius, SAMPLER_LINEAR_CLAMP, ltc_lut1, ltc_lut2, ltc_specular, ltc_fresnel);
+	half f90 = clamp(dot(f0, hvec3(50.0 * 0.33)), metallic, half(1.0));
+	fresnel_color = f0 * max(half(ltc_fresnel.x), half(0.0)) + (f90 - f0) * max(half(ltc_fresnel.y), half(0.0));
+#endif
+
+#if defined(LIGHT_CODE_USED) && defined(AREA_LIGHT_CODE_USED)
+	// Light is written by the user shader. Line lights reuse the area light
+	// contract: the integral is done here, the shader only modulates it.
+	mat4 inv_view_matrix = transpose(mat4(scene_data_block.data.inv_view_matrix[0],
+			scene_data_block.data.inv_view_matrix[1],
+			scene_data_block.data.inv_view_matrix[2],
+			vec4(0.0, 0.0, 0.0, 1.0)));
+	mat4 read_view_matrix = transpose(mat4(scene_data_block.data.view_matrix[0],
+			scene_data_block.data.view_matrix[1],
+			scene_data_block.data.view_matrix[2],
+			vec4(0.0, 0.0, 0.0, 1.0)));
+
+#ifdef USING_MOBILE_RENDERER
+	uint instance_index = draw_call.instance_index;
+#else
+	uint instance_index = instance_index_interp;
+#endif
+
+	mat4 read_model_matrix = transpose(mat4(instances.data[instance_index].transform[0],
+			instances.data[instance_index].transform[1],
+			instances.data[instance_index].transform[2],
+			vec4(0.0, 0.0, 0.0, 1.0)));
+
+#undef projection_matrix
+#define projection_matrix scene_data_block.data.projection_matrix
+#undef inv_projection_matrix
+#define inv_projection_matrix scene_data_block.data.inv_projection_matrix
+
+	vec2 read_viewport_size = scene_data_block.data.viewport_size;
+
+#ifdef LIGHT_BACKLIGHT_USED
+	vec3 backlight_highp = vec3(backlight);
+#endif
+	float roughness_highp = float(roughness);
+	float metallic_highp = float(metallic);
+	vec3 albedo_highp = vec3(albedo);
+	float alpha_highp = float(alpha);
+	vec3 normal_highp = vec3(normal);
+	vec3 light_highp = closest_point / max(length(closest_point), 1e-6);
+	vec3 view_highp = vec3(eye_vec);
+	float specular_amount_highp = float(line_lights.data[idx].specular_amount);
+	vec3 light_color_highp = vec3(color);
+	float attenuation_highp = float(light_attenuation_ltc);
+	vec3 diffuse_light_highp = vec3(diffuse_light);
+	vec3 specular_light_highp = vec3(specular_light);
+	bool is_directional = false;
+	bool is_area = true;
+	vec3 area_diffuse = vec3(ltc_diffuse);
+	vec3 area_specular = ltc_specular * vec3(fresnel_color);
+
+#CODE : LIGHT
+
+	alpha = half(alpha_highp);
+	diffuse_light = hvec3(diffuse_light_highp);
+	specular_light = hvec3(specular_light_highp);
+
+#else
+	half specular_amount = half(line_lights.data[idx].specular_amount);
+	half segment_length = half(sqrt(length_sq));
+	half cc_attenuation = half(1.0);
+
+#if defined(LIGHT_BACKLIGHT_USED) || defined(LIGHT_RIM_USED) || defined(DIFFUSE_TOON) || defined(SPECULAR_TOON)
+	// Unclamped measure, the line counterpart of the quad's solid angle.
+	half measure = half(line_measure(p1, p2, min_radius));
+#endif
+
+#ifdef LIGHT_TRANSMITTANCE_USED
+	{
+		// Without shadows there is no blocker depth, so this degenerates the same
+		// way a shadowless area light does.
+		transmittance_color.a *= light_attenuation;
+#ifdef SSS_MODE_SKIN
+		diffuse_light += SSS_skin(half(ltc_diffuse), transmittance_depth, transmittance_depth, transmittance_boost, transmittance_color, color * segment_length);
+#else
+		diffuse_light += SSS(half(ltc_diffuse), transmittance_depth, transmittance_depth, transmittance_boost, transmittance_color, color * segment_length);
+#endif
+	}
+#endif // LIGHT_TRANSMITTANCE_USED
+
+#if defined(LIGHT_CLEARCOAT_USED)
+	{
+		float cc_specular_ltc = 0.0;
+		vec2 cc_fresnel;
+		ltc_evaluate_line_specular(vec3(vertex_normal), vec3(eye_vec), sqrt(mix(0.001, 0.1, float(clearcoat_roughness))), p1, p2, min_radius, SAMPLER_LINEAR_CLAMP, ltc_lut1, ltc_lut2, cc_specular_ltc, cc_fresnel);
+		half Fr = (half(0.04) * max(half(cc_fresnel.x), half(0.0)) + half(1.0 - 0.04) * max(half(cc_fresnel.y), half(0.0))) * clearcoat;
+		cc_attenuation = half(1.0) - Fr;
+		specular_light += half(cc_specular_ltc) * Fr * color * light_attenuation_ltc * specular_amount;
+	}
+#endif // LIGHT_CLEARCOAT_USED
+
+	if (metallic < half(1.0)) {
+#if defined(DIFFUSE_TOON)
+		half NdotL = half(ltc_diffuse - line_integrate_diffuse(p1, p2, vec3(-normal), min_radius)) / max(measure / half(M_PI), half(0.001));
+		half diffuse_brdf_NL = smoothstep(-roughness, max(roughness, half(0.01)), NdotL) * half(1.0 / M_PI);
+		diffuse_light += diffuse_brdf_NL * color * segment_length * light_attenuation * cc_attenuation;
+#else
+		diffuse_light += half(ltc_diffuse) * color * light_attenuation_ltc * cc_attenuation;
+#endif // DIFFUSE_TOON
+
+#if defined(LIGHT_BACKLIGHT_USED)
+		diffuse_light += color * max(measure / half(M_PI) - half(ltc_diffuse), half(0.0)) * backlight * light_attenuation_ltc;
+#endif
+	}
+
+#if defined(LIGHT_RIM_USED) // same as for point lights
+	half cNdotV = max(dot(normal, eye_vec), half(1e-4));
+	half rim_light = pow(max(half(1e-4), half(1.0) - cNdotV), max(half(0.0), (half(1.0) - roughness) * half(16.0)));
+	diffuse_light += rim_light * rim * mix(hvec3(1.0), albedo, rim_tint) * color * measure * light_attenuation_ltc;
+#endif
+
+#if defined(SPECULAR_TOON)
+	half mid = half(1.0) - roughness;
+	mid *= mid;
+
+	half RdotV = half(ltc_specular) / max(measure / half(M_PI), half(0.001));
+	half intensity = smoothstep(mid - roughness * half(0.5), mid + roughness * half(0.5), RdotV) * mid;
+	diffuse_light += intensity * color * segment_length * light_attenuation * specular_amount; // write to diffuse_light, as in toon shading you generally want no reflection
+#elif defined(SPECULAR_DISABLED)
+	// do nothing
+#else
+	specular_light += half(ltc_specular) * color * fresnel_color * specular_amount * light_attenuation_ltc * cc_attenuation * energy_compensation;
 #endif // SPECULAR_TOON
 
 #endif // LIGHT_CODE_USED

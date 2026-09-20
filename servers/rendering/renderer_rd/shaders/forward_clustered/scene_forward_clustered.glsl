@@ -2970,6 +2970,60 @@ void fragment_shader(in SceneData scene_data) {
 			}
 		}
 	}
+
+	if (sc_cluster_has_line_light()) { // line lights
+
+		uint cluster_line_offset = cluster_offset + implementation_data.cluster_type_size * 5;
+
+		uint item_min;
+		uint item_max;
+		uint item_from;
+		uint item_to;
+
+		cluster_get_item_range(cluster_line_offset + implementation_data.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
+
+		item_from = subgroupBroadcastFirst(subgroupMin(item_from));
+		item_to = subgroupBroadcastFirst(subgroupMax(item_to));
+
+		for (uint i = item_from; i < item_to; i++) {
+			uint mask = cluster_buffer.data[cluster_line_offset + i];
+			mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+
+			uint merged_mask = subgroupBroadcastFirst(subgroupOr(mask));
+			while (merged_mask != 0) {
+				uint bit = findMSB(merged_mask);
+				merged_mask &= ~(1u << bit);
+
+				if (((1u << bit) & mask) == 0) { //do not process if not originally here
+					continue;
+				}
+
+				uint light_index = 32 * i + bit;
+
+				if (!bool(line_lights.data[light_index].mask & instances.data[instance_index].layer_mask)) {
+					continue; //not masked
+				}
+
+				light_process_line(light_index, vertex, view, normal, f0, roughness, metallic, albedo, alpha, screen_uv, energy_compensation,
+#ifdef LIGHT_BACKLIGHT_USED
+						backlight,
+#endif
+#ifdef LIGHT_TRANSMITTANCE_USED
+						transmittance_color,
+						transmittance_depth,
+						transmittance_boost,
+#endif
+#ifdef LIGHT_RIM_USED
+						rim,
+						rim_tint,
+#endif
+#ifdef LIGHT_CLEARCOAT_USED
+						clearcoat, clearcoat_roughness, geo_normal,
+#endif
+						diffuse_light, direct_specular_light);
+			}
+		}
+	}
 #endif // !USE_VERTEX_LIGHTING
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
 

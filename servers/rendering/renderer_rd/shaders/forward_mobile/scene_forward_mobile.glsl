@@ -2328,6 +2328,35 @@ void main() {
 #endif
 				diffuse_light, direct_specular_light);
 	}
+
+	uint line_light_count = sc_line_lights(8);
+	uvec2 line_indices = instances.data[draw_call.instance_index].line_lights;
+	for (uint i = 0; i < line_light_count; i++) {
+		uint light_index = (i > 3) ? ((line_indices.y >> ((i - 4) * 8)) & 0xFF) : ((line_indices.x >> (i * 8)) & 0xFF);
+		if (i > 0 && light_index == 0xFF) {
+			break;
+		}
+
+		light_process_line(light_index, vertex, view, normal, f0, roughness, metallic, albedo, alpha, screen_uv, hvec3(1.0),
+#ifdef LIGHT_BACKLIGHT_USED
+				backlight,
+#endif
+/*
+#ifdef LIGHT_TRANSMITTANCE_USED
+				transmittance_color,
+				transmittance_depth,
+				transmittance_boost,
+#endif
+*/
+#ifdef LIGHT_RIM_USED
+				rim,
+				rim_tint,
+#endif
+#ifdef LIGHT_CLEARCOAT_USED
+				clearcoat, clearcoat_roughness, geo_normal,
+#endif // LIGHT_CLEARCOAT_USED
+				diffuse_light, direct_specular_light);
+	}
 #endif // !VERTEX_LIGHTING
 
 #endif //!defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)

@@ -131,6 +131,9 @@ ForwardIDType LightStorage::_light_type_to_forward_id_type(RSE::LightType p_type
 		case RSE::LIGHT_AREA: {
 			return FORWARD_ID_TYPE_AREA_LIGHT;
 		} break;
+		case RSE::LIGHT_LINE: {
+			return FORWARD_ID_TYPE_LINE_LIGHT;
+		} break;
 		default: {
 			CRASH_NOW_MSG("Supplied LightType has no equivalent forward type.");
 		} break;
@@ -201,6 +204,20 @@ void LightStorage::area_light_initialize(RID p_rid) {
 	_light_initialize(p_rid, RSE::LIGHT_AREA);
 }
 
+RID LightStorage::line_light_allocate() {
+	return light_owner.allocate_rid();
+}
+
+void LightStorage::line_light_initialize(RID p_rid) {
+	_light_initialize(p_rid, RSE::LIGHT_LINE);
+
+	// Line lights support neither shadows nor baked GI yet, so keep them out of
+	// every baker and shadow path from the start (the struct default is DYNAMIC).
+	Light *light = light_owner.get_or_null(p_rid);
+	ERR_FAIL_NULL(light);
+	light->bake_mode = RSE::LIGHT_BAKE_DISABLED;
+}
+
 void LightStorage::light_free(RID p_rid) {
 	light_set_projector(p_rid, RID()); //clear projector
 	light_area_set_texture(p_rid, RID()); //clear area texture
@@ -256,7 +273,9 @@ void LightStorage::light_set_param(RID p_light, RSE::LightParam p_param, float p
 void LightStorage::light_set_shadow(RID p_light, bool p_enabled) {
 	Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL(light);
-	light->shadow = p_enabled;
+	// Line lights have no shadow implementation yet. Refusing here keeps every
+	// shadow path (atlas allocation, culling, render passes) unreachable for them.
+	light->shadow = p_enabled && light->type != RSE::LIGHT_LINE;
 
 	light->version++;
 	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
@@ -268,6 +287,12 @@ void LightStorage::light_set_projector(RID p_light, RID p_texture) {
 	ERR_FAIL_NULL(light);
 
 	if (light->projector == p_texture) {
+		return;
+	}
+
+	// Line lights have no projector support. Refusing here keeps them out of the
+	// decal atlas and stops them from forcing the projector shader variant.
+	if (light->type == RSE::LIGHT_LINE) {
 		return;
 	}
 
@@ -345,7 +370,9 @@ void LightStorage::light_set_bake_mode(RID p_light, RSE::LightBakeMode p_bake_mo
 	Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL(light);
 
-	light->bake_mode = p_bake_mode;
+	// Line lights are not supported by any GI baker yet; keeping them disabled
+	// means SDFGI, VoxelGI and LightmapGI all skip them without extra checks.
+	light->bake_mode = light->type == RSE::LIGHT_LINE ? RSE::LIGHT_BAKE_DISABLED : p_bake_mode;
 
 	light->version++;
 	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
@@ -465,6 +492,21 @@ bool LightStorage::light_area_get_normalize_energy(RID p_light) const {
 	return light->area_normalize_energy;
 }
 
+void LightStorage::light_line_set_length(RID p_light, float p_length) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+	light->line_length = MAX(p_length, 0.0f);
+	light->version++;
+	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
+}
+
+void LightStorage::light_line_set_normalize_energy(RID p_light, bool p_enabled) {
+	Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light);
+	// Shared with area lights: both mean "divide energy by the emitter's size".
+	light->area_normalize_energy = p_enabled;
+}
+
 void LightStorage::light_area_set_texture(RID p_light, RID p_texture) {
 	TextureStorage *texture_storage = TextureStorage::get_singleton();
 	Light *light = light_owner.get_or_null(p_light);
@@ -547,6 +589,12 @@ AABB LightStorage::light_get_aabb(RID p_light) const {
 			float width = light->area_size.x / 2.0 + len;
 			float height = light->area_size.y / 2.0 + len;
 			return AABB(-Vector3(width, height, 0), Vector3(width * 2, height * 2, -len));
+		};
+		case RSE::LIGHT_LINE: {
+			// The segment lies along local X and lights in every direction.
+			float len = light->param[RSE::LIGHT_PARAM_RANGE];
+			float half_width = light->line_length / 2.0 + len;
+			return AABB(-Vector3(half_width, len, len), Vector3(half_width, len, len) * 2.0);
 		};
 		case RSE::LIGHT_DIRECTIONAL: {
 			return AABB();
@@ -669,6 +717,11 @@ void LightStorage::free_light_data() {
 		area_light_buffer = RID();
 	}
 
+	if (line_light_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(line_light_buffer);
+		line_light_buffer = RID();
+	}
+
 	if (directional_lights != nullptr) {
 		memdelete_arr(directional_lights);
 		directional_lights = nullptr;
@@ -689,6 +742,11 @@ void LightStorage::free_light_data() {
 		area_lights = nullptr;
 	}
 
+	if (line_lights != nullptr) {
+		memdelete_arr(line_lights);
+		line_lights = nullptr;
+	}
+
 	if (omni_light_sort != nullptr) {
 		memdelete_arr(omni_light_sort);
 		omni_light_sort = nullptr;
@@ -702,6 +760,11 @@ void LightStorage::free_light_data() {
 	if (area_light_sort != nullptr) {
 		memdelete_arr(area_light_sort);
 		area_light_sort = nullptr;
+	}
+
+	if (line_light_sort != nullptr) {
+		memdelete_arr(line_light_sort);
+		line_light_sort = nullptr;
 	}
 }
 
@@ -721,6 +784,10 @@ void LightStorage::set_max_lights(const uint32_t p_max_lights) {
 	area_light_buffer = RD::get_singleton()->storage_buffer_create(light_buffer_size);
 	area_light_sort = memnew_arr(LightInstanceDepthSort, max_lights);
 
+	line_lights = memnew_arr(LightData, max_lights);
+	line_light_buffer = RD::get_singleton()->storage_buffer_create(light_buffer_size);
+	line_light_sort = memnew_arr(LightInstanceDepthSort, max_lights);
+
 	max_directional_lights = RendererSceneRender::MAX_DIRECTIONAL_LIGHTS;
 	uint32_t directional_light_buffer_size = max_directional_lights * sizeof(DirectionalLightData);
 	directional_lights = memnew_arr(DirectionalLightData, max_directional_lights);
@@ -739,6 +806,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 	omni_light_count = 0;
 	spot_light_count = 0;
 	area_light_count = 0;
+	line_light_count = 0;
 	uint32_t directional_contact_shadows_count = 0;
 
 	r_directional_light_soft_shadows = false;
@@ -956,7 +1024,32 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 				area_light_sort[area_light_count].light = light;
 				area_light_sort[area_light_count].depth = distance;
 				area_light_count++;
-			}
+			} break;
+			case RSE::LIGHT_LINE: {
+				if (line_light_count >= max_lights) {
+					continue;
+				}
+
+				Transform3D light_transform = light_instance->transform;
+				const real_t distance = p_camera_transform.origin.distance_to(light_transform.origin);
+
+				if (light->distance_fade) {
+					const float fade_begin = light->distance_fade_begin;
+					const float fade_length = light->distance_fade_length;
+
+					if (distance > fade_begin) {
+						if (distance > fade_begin + fade_length) {
+							// Out of range, don't draw this light, to improve performance.
+							continue;
+						}
+					}
+				}
+
+				line_light_sort[line_light_count].light_instance = light_instance;
+				line_light_sort[line_light_count].light = light;
+				line_light_sort[line_light_count].depth = distance;
+				line_light_count++;
+			} break;
 		}
 
 		light_instance->last_pass = RSG::rasterizer->get_frame_number();
@@ -977,9 +1070,14 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 		sorter.sort(area_light_sort, area_light_count);
 	}
 
+	if (line_light_count) {
+		SortArray<LightInstanceDepthSort> sorter;
+		sorter.sort(line_light_sort, line_light_count);
+	}
+
 	bool using_forward_ids = forward_id_storage->uses_forward_ids();
 
-	for (uint32_t i = 0; i < (omni_light_count + spot_light_count + area_light_count); i++) {
+	for (uint32_t i = 0; i < (omni_light_count + spot_light_count + area_light_count + line_light_count); i++) {
 		uint32_t index;
 		LightData *light_data_ptr;
 		RSE::LightType type;
@@ -987,7 +1085,14 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 		Light *light;
 		real_t distance;
 
-		if (i >= omni_light_count + spot_light_count) {
+		if (i >= omni_light_count + spot_light_count + area_light_count) {
+			index = i - (omni_light_count + spot_light_count + area_light_count);
+			light_data_ptr = &line_lights[index];
+			type = RSE::LIGHT_LINE;
+			light_instance = line_light_sort[index].light_instance;
+			light = line_light_sort[index].light;
+			distance = line_light_sort[index].depth;
+		} else if (i >= omni_light_count + spot_light_count) {
 			index = i - (omni_light_count + spot_light_count);
 			light_data_ptr = &area_lights[index];
 			type = RSE::LIGHT_AREA;
@@ -1051,7 +1156,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 			energy *= light->param[RSE::LIGHT_PARAM_INTENSITY];
 
 			// Convert from Luminous Power to Luminous Intensity
-			if (type == RSE::LIGHT_OMNI) {
+			if (type == RSE::LIGHT_OMNI || type == RSE::LIGHT_LINE) {
 				energy *= 1.0 / (Math::PI * 4.0);
 			} else if (type == RSE::LIGHT_AREA) {
 				energy *= 1.0 / (Math::PI * 2.0);
@@ -1115,6 +1220,30 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 				light_data.color[0] /= surface_area;
 				light_data.color[1] /= surface_area;
 				light_data.color[2] /= surface_area;
+			}
+		} else if (type == RSE::LIGHT_LINE) {
+			// The segment lies along the light's local X axis, centered on its origin.
+			// `area_width` carries the full segment vector; `area_height` is unused.
+			float length = light->line_length;
+			Vector3 segment = inverse_transform.basis.xform(light_transform.basis.xform(Vector3(1, 0, 0))).normalized() * length;
+
+			light_data.area_width[0] = segment.x;
+			light_data.area_width[1] = segment.y;
+			light_data.area_width[2] = segment.z;
+
+			light_data.area_height[0] = 0.0;
+			light_data.area_height[1] = 0.0;
+			light_data.area_height[2] = 0.0;
+			// Spot-only fields; keep sane values out of the shared buffer.
+			light_data.inv_spot_attenuation = 0.0;
+			light_data.cos_spot_angle = 0.0;
+
+			if (light->area_normalize_energy && length > 0.0) {
+				// Keep total output independent of length, so that a short broadside
+				// line matches an omni light of the same energy.
+				light_data.color[0] /= length;
+				light_data.color[1] /= length;
+				light_data.color[2] /= length;
 			}
 		}
 		light_data.mask = light->cull_mask;
@@ -1256,7 +1385,9 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 		light_instance->cull_mask = light->cull_mask;
 
 		// hook for subclass to do further processing.
-		RendererSceneRenderRD::get_singleton()->setup_added_light(type, light_transform, radius, spot_angle, area_size);
+		// Line lights have no height; the cluster builder reads the segment length from x.
+		const Vector2 cluster_size = type == RSE::LIGHT_LINE ? Vector2(light->line_length, 0) : area_size;
+		RendererSceneRenderRD::get_singleton()->setup_added_light(type, light_transform, radius, spot_angle, cluster_size);
 
 		r_positional_light_count++;
 	}
@@ -1272,6 +1403,10 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 
 	if (area_light_count) {
 		RD::get_singleton()->buffer_update(area_light_buffer, 0, sizeof(LightData) * area_light_count, area_lights);
+	}
+
+	if (line_light_count) {
+		RD::get_singleton()->buffer_update(line_light_buffer, 0, sizeof(LightData) * line_light_count, line_lights);
 	}
 
 	if (r_directional_light_count) {

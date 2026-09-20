@@ -134,6 +134,21 @@ void RenderForwardMobile::fill_push_constant_instance_indices(SceneState::Instan
 		}
 	}
 
+	p_instance_data->line_lights[0] = 0xFFFFFFFF;
+	p_instance_data->line_lights[1] = 0xFFFFFFFF;
+
+	idx = 0;
+	for (uint32_t i = 0; i < p_instance->line_light_count; i++) {
+		uint32_t ofs = idx < 4 ? 0 : 1;
+		uint32_t shift = (idx & 0x3) << 3;
+		uint32_t mask = ~(0xFF << shift);
+		if (forward_id_storage_mobile->forward_id_allocators[RendererRD::FORWARD_ID_TYPE_LINE_LIGHT].last_pass[p_instance->line_lights[i]] == current_frame) {
+			p_instance_data->line_lights[ofs] &= mask;
+			p_instance_data->line_lights[ofs] |= uint32_t(forward_id_storage_mobile->forward_id_allocators[RendererRD::FORWARD_ID_TYPE_LINE_LIGHT].map[p_instance->line_lights[i]]) << shift;
+			idx++;
+		}
+	}
+
 	p_instance_data->decals[0] = 0xFFFFFFFF;
 	p_instance_data->decals[1] = 0xFFFFFFFF;
 
@@ -2077,6 +2092,14 @@ void RenderForwardMobile::_update_render_base_uniform_set() {
 			uniforms.push_back(u);
 		}
 
+		{
+			RD::Uniform u;
+			u.binding = 18;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.append_id(RendererRD::LightStorage::get_singleton()->get_line_light_buffer());
+			uniforms.push_back(u);
+		}
+
 		render_base_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(scene_shader.default_shader_rd, SCENE_UNIFORM_SET, uniforms);
 	}
 }
@@ -2517,6 +2540,7 @@ void RenderForwardMobile::_render_list_template(RenderingDevice::DrawListID p_dr
 			pipeline_specialization.omni_lights = SceneShaderForwardMobile::shader_count_for(inst->omni_light_count);
 			pipeline_specialization.spot_lights = SceneShaderForwardMobile::shader_count_for(inst->spot_light_count);
 			pipeline_specialization.area_lights = SceneShaderForwardMobile::shader_count_for(inst->area_light_count);
+			pipeline_specialization.line_lights = SceneShaderForwardMobile::shader_count_for(inst->line_light_count);
 			pipeline_specialization.reflection_probes = SceneShaderForwardMobile::shader_count_for(inst->reflection_probe_count);
 			pipeline_specialization.decals = inst->decals_count > 0;
 			pipeline_specialization.use_lightmap_specular = element_info.uses_lightmap_specular;
@@ -2824,6 +2848,7 @@ void RenderForwardMobile::GeometryInstanceForwardMobile::clear_light_instances()
 	omni_light_count = 0;
 	spot_light_count = 0;
 	area_light_count = 0;
+	line_light_count = 0;
 }
 
 void RenderForwardMobile::GeometryInstanceForwardMobile::pair_light_instance(
@@ -2847,6 +2872,12 @@ void RenderForwardMobile::GeometryInstanceForwardMobile::pair_light_instance(
 				area_lights[placement_idx] = light_id;
 				if (placement_idx >= area_light_count) {
 					area_light_count = placement_idx + 1;
+				}
+			} break;
+			case RSE::LIGHT_LINE: {
+				line_lights[placement_idx] = light_id;
+				if (placement_idx >= line_light_count) {
+					line_light_count = placement_idx + 1;
 				}
 			} break;
 			default:

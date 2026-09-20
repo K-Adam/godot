@@ -1816,7 +1816,11 @@ void RendererSceneCull::_update_instance(Instance *p_instance) const {
 				InstanceLightData *light_data = static_cast<InstanceLightData *>(p_instance->base_data);
 				idata.instance_data_rid = light_data->instance.get_id();
 				light_data->uses_projector = RSG::light_storage->light_has_projector(p_instance->base);
-				light_data->uses_softshadow = RSG::light_storage->light_get_type(p_instance->base) == RSE::LIGHT_AREA || RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_SIZE) > CMP_EPSILON;
+				const RSE::LightType light_type = RSG::light_storage->light_get_type(p_instance->base);
+				// A line light's LIGHT_PARAM_SIZE is a regularization radius rather than
+				// a shadow softness, and line lights cast no shadows at all.
+				light_data->uses_softshadow = light_type == RSE::LIGHT_AREA ||
+						(light_type != RSE::LIGHT_LINE && RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_SIZE) > CMP_EPSILON);
 			} break;
 			case RSE::INSTANCE_REFLECTION_PROBE: {
 				idata.instance_data_rid = static_cast<InstanceReflectionProbeData *>(p_instance->base_data)->instance.get_id();
@@ -2402,6 +2406,10 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 	switch (RSG::light_storage->light_get_type(p_instance->base)) {
 		case RSE::LIGHT_DIRECTIONAL: {
 		} break;
+		case RSE::LIGHT_LINE: {
+			// Line lights cast no shadows; light_set_shadow() keeps them out of
+			// the shadow atlas, so this is unreachable in practice.
+		} break;
 		case RSE::LIGHT_OMNI: {
 			RSE::LightOmniShadowMode shadow_mode = RSG::light_storage->light_omni_get_shadow_mode(p_instance->base);
 
@@ -2919,10 +2927,11 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 
 	// Minimize allocations when picking the most relevant lights per mesh.
 	// We need to track the score and current index of the best N lights.
-	thread_local LocalVector<Pair<float, uint32_t>> omni_score_idx, spot_score_idx, area_score_idx;
+	thread_local LocalVector<Pair<float, uint32_t>> omni_score_idx, spot_score_idx, area_score_idx, line_score_idx;
 	omni_score_idx.clear();
 	spot_score_idx.clear();
 	area_score_idx.clear();
+	line_score_idx.clear();
 	uint32_t max_lights_per_mesh = scene_render->get_max_lights_per_mesh();
 	uint32_t max_lights_total = scene_render->get_max_lights_total();
 
@@ -3042,12 +3051,13 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 						geom->geometry_instance->clear_light_instances();
 						if ((max_lights_per_mesh > 0) && (max_lights_total > 0)) {
 							// For the top N lights, track the score and the index into the internal light storage array.
-							uint32_t total_omni_count = 0, total_spot_count = 0, total_area_count = 0;
-							bool omni_needs_heap = true, spot_needs_heap = true, area_needs_heap = true;
-							uint32_t omni_count = 0, spot_count = 0, area_count = 0;
+							uint32_t total_omni_count = 0, total_spot_count = 0, total_area_count = 0, total_line_count = 0;
+							bool omni_needs_heap = true, spot_needs_heap = true, area_needs_heap = true, line_needs_heap = true;
+							uint32_t omni_count = 0, spot_count = 0, area_count = 0, line_count = 0;
 							omni_score_idx.clear();
 							spot_score_idx.clear();
 							area_score_idx.clear();
+							line_score_idx.clear();
 							SortArray<Pair<float, uint32_t>> heapify; // SortArray has heap functions, but no local storage.
 							// Iterate over the lights (possibly > max_renderable_lights), keeping the closest to the mesh center.
 							Vector3 mesh_center = idata.instance->transformed_aabb.get_center();
@@ -3055,7 +3065,8 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 								RSE::LightType light_type = RSG::light_storage->light_get_type(E->base);
 								if (((RSE::LIGHT_OMNI == light_type) && (total_omni_count++ < max_lights_total)) ||
 										((RSE::LIGHT_SPOT == light_type) && (total_spot_count++ < max_lights_total)) ||
-										((RSE::LIGHT_AREA == light_type) && (total_area_count++ < max_lights_total))) {
+										((RSE::LIGHT_AREA == light_type) && (total_area_count++ < max_lights_total)) ||
+										((RSE::LIGHT_LINE == light_type) && (total_line_count++ < max_lights_total))) {
 									// Perform culling.
 									if (!(RSG::light_storage->light_get_cull_mask(E->base) & idata.layer_mask)) {
 										continue;
@@ -3083,84 +3094,48 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 #if VERIFY_RELEVANT_LIGHT_HEAP
 									WARN_PRINT_ONCE("VERIFY_RELEVANT_LIGHT_HEAP is True");
 #endif
+									// Same bookkeeping for every light type: fill up to
+									// max_lights_per_mesh, then replace the worst entry if this
+									// light scores better.
+									auto keep_best_lights = [&](LocalVector<Pair<float, uint32_t>> &r_score_idx, uint32_t &r_count, bool &r_needs_heap) {
+										if (r_count < max_lights_per_mesh) {
+											// We have room to just add it, and track the score and where it goes.
+											r_score_idx.push_back(Pair(light_inst_score, r_count));
+											geom->geometry_instance->pair_light_instance(light->instance, light_type, r_count++);
+											return;
+										}
+										if (r_needs_heap) {
+											// We need to make this a heap one time.
+											heapify.make_heap(0, r_count, &r_score_idx[0]);
+											r_needs_heap = false;
+										}
+										if (light_inst_score < r_score_idx[0].first) {
+#if VERIFY_RELEVANT_LIGHT_HEAP
+											// The [0] element should have the max score.
+											for (uint32_t vi = 1; vi < max_lights_per_mesh; ++vi) {
+												if (r_score_idx[vi].first > r_score_idx[0].first) {
+													ERR_PRINT_ONCE("Relevant Light Heap Error");
+												}
+											}
+#endif
+											uint32_t replace_index = r_score_idx[0].second;
+											geom->geometry_instance->pair_light_instance(light->instance, light_type, replace_index);
+											heapify.adjust_heap(0, 0, r_count, Pair(light_inst_score, replace_index), &r_score_idx[0]);
+										}
+									};
+
 									switch (light_type) {
 										case RSE::LIGHT_OMNI: {
-											if (omni_count < max_lights_per_mesh) {
-												// We have room to just add it, and track the score and where it goes.
-												omni_score_idx.push_back(Pair(light_inst_score, omni_count));
-												geom->geometry_instance->pair_light_instance(light->instance, light_type, omni_count++);
-											} else {
-												if (omni_needs_heap) {
-													// We need to make this a heap one time.
-													heapify.make_heap(0, omni_count, &omni_score_idx[0]);
-													omni_needs_heap = false;
-												}
-												if (light_inst_score < omni_score_idx[0].first) {
-#if VERIFY_RELEVANT_LIGHT_HEAP
-													// The [0] element should have the max score.
-													for (uint32_t vi = 1; vi < max_lights_per_mesh; ++vi) {
-														if (omni_score_idx[vi].first > omni_score_idx[0].first) {
-															ERR_PRINT_ONCE("Relevant Omni Light Heap Error");
-														}
-													}
-#endif
-													uint32_t replace_index = omni_score_idx[0].second;
-													geom->geometry_instance->pair_light_instance(light->instance, light_type, replace_index);
-													heapify.adjust_heap(0, 0, omni_count, Pair(light_inst_score, replace_index), &omni_score_idx[0]);
-												}
-											}
+											keep_best_lights(omni_score_idx, omni_count, omni_needs_heap);
 										} break;
 										case RSE::LIGHT_SPOT: {
-											if (spot_count < max_lights_per_mesh) {
-												// We have room to just add it, and track the score and where it goes.
-												spot_score_idx.push_back(Pair(light_inst_score, spot_count));
-												geom->geometry_instance->pair_light_instance(light->instance, light_type, spot_count++);
-											} else {
-												if (spot_needs_heap) {
-													// We need to make this a heap one time.
-													heapify.make_heap(0, spot_count, &spot_score_idx[0]);
-													spot_needs_heap = false;
-												}
-												if (light_inst_score < spot_score_idx[0].first) {
-#if VERIFY_RELEVANT_LIGHT_HEAP
-													// The [0] element should have the max score.
-													for (uint32_t vi = 1; vi < max_lights_per_mesh; ++vi) {
-														if (spot_score_idx[vi].first > spot_score_idx[0].first) {
-															ERR_PRINT_ONCE("Relevant Spot Light Heap Error");
-														}
-													}
-#endif
-													uint32_t replace_index = spot_score_idx[0].second;
-													geom->geometry_instance->pair_light_instance(light->instance, light_type, replace_index);
-													heapify.adjust_heap(0, 0, spot_count, Pair(light_inst_score, replace_index), &spot_score_idx[0]);
-												}
-											}
+											keep_best_lights(spot_score_idx, spot_count, spot_needs_heap);
 										} break;
 										case RSE::LIGHT_AREA: {
-											if (area_count < max_lights_per_mesh) {
-												// We have room to just add it, and track the score and where it goes.
-												area_score_idx.push_back(Pair(light_inst_score, area_count));
-												geom->geometry_instance->pair_light_instance(light->instance, light_type, area_count++);
-											} else {
-												if (area_needs_heap) {
-													// We need to make this a heap one time.
-													heapify.make_heap(0, area_count, &area_score_idx[0]);
-													area_needs_heap = false;
-												}
-												if (light_inst_score < area_score_idx[0].first) {
-#if VERIFY_RELEVANT_LIGHT_HEAP
-													// The [0] element should have the max score.
-													for (uint32_t vi = 1; vi < max_lights_per_mesh; ++vi) {
-														if (area_score_idx[vi].first > area_score_idx[0].first) {
-															ERR_PRINT_ONCE("Relevant Area Light Heap Error");
-														}
-													}
-#endif
-													uint32_t replace_index = area_score_idx[0].second;
-													geom->geometry_instance->pair_light_instance(light->instance, light_type, replace_index);
-													heapify.adjust_heap(0, 0, area_count, Pair(light_inst_score, replace_index), &area_score_idx[0]);
-												}
-											}
+											keep_best_lights(area_score_idx, area_count, area_needs_heap);
+										} break;
+										case RSE::LIGHT_LINE: {
+											keep_best_lights(line_score_idx, line_count, line_needs_heap);
 										} break;
 										default:
 											break;

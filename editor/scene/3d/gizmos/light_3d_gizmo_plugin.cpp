@@ -47,6 +47,7 @@ Light3DGizmoPlugin::Light3DGizmoPlugin() {
 	create_icon_material("light_omni_icon", EditorNode::get_singleton()->get_editor_theme()->get_icon(SNAME("GizmoLight"), EditorStringName(EditorIcons)));
 	create_icon_material("light_spot_icon", EditorNode::get_singleton()->get_editor_theme()->get_icon(SNAME("GizmoSpotLight"), EditorStringName(EditorIcons)));
 	create_icon_material("light_area_icon", EditorNode::get_singleton()->get_editor_theme()->get_icon(SNAME("GizmoAreaLight"), EditorStringName(EditorIcons)));
+	create_icon_material("light_line_icon", EditorNode::get_singleton()->get_editor_theme()->get_icon(SNAME("GizmoLineLight"), EditorStringName(EditorIcons)));
 
 	create_handle_material("handles");
 	create_handle_material("handles_billboard", true);
@@ -68,6 +69,8 @@ String Light3DGizmoPlugin::get_handle_name(const EditorNode3DGizmo *p_gizmo, int
 	if (p_id == 0) {
 		if (Object::cast_to<AreaLight3D>(p_gizmo->get_node_3d())) {
 			return "Area width";
+		} else if (Object::cast_to<LineLight3D>(p_gizmo->get_node_3d())) {
+			return "Line length";
 		} else {
 			return "Radius";
 		}
@@ -86,9 +89,12 @@ Variant Light3DGizmoPlugin::get_handle_value(const EditorNode3DGizmo *p_gizmo, i
 		AreaLight3D *al = Object::cast_to<AreaLight3D>(light);
 		if (al) {
 			return al->get_area_size();
-		} else {
-			return light->get_param(Light3D::PARAM_RANGE);
 		}
+		LineLight3D *ll = Object::cast_to<LineLight3D>(light);
+		if (ll) {
+			return ll->get_line_length();
+		}
+		return light->get_param(Light3D::PARAM_RANGE);
 	}
 	if (p_id == 1) {
 		AreaLight3D *al = Object::cast_to<AreaLight3D>(light);
@@ -112,7 +118,19 @@ void Light3DGizmoPlugin::set_handle(const EditorNode3DGizmo *p_gizmo, int p_id, 
 
 	Vector3 s[2] = { gi.xform(ray_from), gi.xform(ray_from + ray_dir * 4096) };
 	if (p_id == 0) {
-		if (Object::cast_to<SpotLight3D>(light)) {
+		if (LineLight3D *ll = Object::cast_to<LineLight3D>(light)) {
+			// The segment lies along local X and is centered, so the handle sits at
+			// half the length.
+			Vector3 ra, rb;
+			Geometry3D::get_closest_points_between_segments(Vector3(), Vector3(4096, 0, 0), s[0], s[1], ra, rb);
+
+			float d = ra.x * 2.0;
+			if (Node3DEditor::get_singleton()->is_snap_enabled()) {
+				d = Math::snapped(d, Node3DEditor::get_singleton()->get_translate_snap());
+			}
+
+			ll->set_line_length(MAX(d, 0.0));
+		} else if (Object::cast_to<SpotLight3D>(light)) {
 			Vector3 ra, rb;
 			Geometry3D::get_closest_points_between_segments(Vector3(), Vector3(0, 0, -4096), s[0], s[1], ra, rb);
 
@@ -206,15 +224,24 @@ void Light3DGizmoPlugin::commit_handle(const EditorNode3DGizmo *p_gizmo, int p_i
 	Light3D *light = Object::cast_to<Light3D>(p_gizmo->get_node_3d());
 	if (p_cancel) {
 		AreaLight3D *al = Object::cast_to<AreaLight3D>(light);
+		LineLight3D *ll = Object::cast_to<LineLight3D>(light);
 		if (al) {
 			al->set_area_size(p_restore);
+		} else if (ll) {
+			ll->set_line_length(p_restore);
 		} else {
 			light->set_param(p_id == 0 ? Light3D::PARAM_RANGE : Light3D::PARAM_SPOT_ANGLE, p_restore);
 		}
 	} else if (p_id == 0) {
 		EditorUndoRedoManager *ur = EditorUndoRedoManager::get_singleton();
 		AreaLight3D *al = Object::cast_to<AreaLight3D>(light);
-		if (al) {
+		LineLight3D *ll = Object::cast_to<LineLight3D>(light);
+		if (ll) {
+			ur->create_action(TTR("Change Line Light Length"));
+			ur->add_do_method(ll, "set_line_length", ll->get_line_length());
+			ur->add_undo_method(ll, "set_line_length", p_restore);
+			ur->commit_action();
+		} else if (al) {
 			ur->create_action(TTR("Change Area Light Width"));
 			ur->add_do_method(al, "set_area_size", al->get_area_size());
 			ur->add_undo_method(al, "set_area_size", p_restore);
@@ -414,6 +441,24 @@ void Light3DGizmoPlugin::redraw(EditorNode3DGizmo *p_gizmo) {
 		}
 
 		const Ref<Material> icon = get_material("light_area_icon", p_gizmo);
+		p_gizmo->add_unscaled_billboard(icon, 0.05, color);
+	}
+
+	if (LineLight3D *ll = Object::cast_to<LineLight3D>(light)) {
+		if (p_gizmo->is_selected()) {
+			const float half_length = ll->get_line_length() / 2.0;
+
+			Vector<Vector3> points = {
+				Vector3(-half_length, 0, 0),
+				Vector3(half_length, 0, 0)
+			};
+			p_gizmo->add_lines(points, get_material("lines_primary", p_gizmo), false, color);
+
+			Vector<Vector3> handles = { Vector3(half_length, 0, 0) };
+			p_gizmo->add_handles(handles, get_material("handles"));
+		}
+
+		const Ref<Material> icon = get_material("light_line_icon", p_gizmo);
 		p_gizmo->add_unscaled_billboard(icon, 0.05, color);
 	}
 }

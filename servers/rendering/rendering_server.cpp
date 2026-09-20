@@ -2529,6 +2529,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("omni_light_create"), &RenderingServer::omni_light_create);
 	ClassDB::bind_method(D_METHOD("spot_light_create"), &RenderingServer::spot_light_create);
 	ClassDB::bind_method(D_METHOD("area_light_create"), &RenderingServer::area_light_create);
+	ClassDB::bind_method(D_METHOD("line_light_create"), &RenderingServer::line_light_create);
 
 	ClassDB::bind_method(D_METHOD("light_set_color", "light", "color"), &RenderingServer::light_set_color);
 	ClassDB::bind_method(D_METHOD("light_set_param", "light", "param", "value"), &RenderingServer::light_set_param);
@@ -2552,6 +2553,9 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("light_area_set_size", "light", "size"), &RenderingServer::light_area_set_size);
 	ClassDB::bind_method(D_METHOD("light_area_set_normalize_energy", "light", "enable"), &RenderingServer::light_area_set_normalize_energy);
 
+	ClassDB::bind_method(D_METHOD("light_line_set_length", "light", "length"), &RenderingServer::light_line_set_length);
+	ClassDB::bind_method(D_METHOD("light_line_set_normalize_energy", "light", "enable"), &RenderingServer::light_line_set_normalize_energy);
+
 	ClassDB::bind_method(D_METHOD("light_projectors_set_filter", "filter"), &RenderingServer::light_projectors_set_filter);
 	ClassDB::bind_method(D_METHOD("lightmaps_set_bicubic_filter", "enable"), &RenderingServer::lightmaps_set_bicubic_filter);
 
@@ -2566,6 +2570,7 @@ void RenderingServer::_bind_methods() {
 	BIND_ENUM_CONSTANT(RSE::LIGHT_OMNI);
 	BIND_ENUM_CONSTANT(RSE::LIGHT_SPOT);
 	BIND_ENUM_CONSTANT(RSE::LIGHT_AREA);
+	BIND_ENUM_CONSTANT(RSE::LIGHT_LINE);
 
 	BIND_ENUM_CONSTANT(RSE::LIGHT_PARAM_ENERGY);
 	BIND_ENUM_CONSTANT(RSE::LIGHT_PARAM_INDIRECT_ENERGY);
