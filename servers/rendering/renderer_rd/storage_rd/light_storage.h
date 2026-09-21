@@ -131,8 +131,20 @@ private:
 
 		ForwardID forward_id = -1;
 
+		// One extra instance per additional shadow section, each holding its own
+		// atlas slot pair and shadow camera. Section 0 is this instance. Sections are
+		// never shaded, never paired with geometry and never get a forward ID.
+		LocalVector<RID> shadow_sections;
+		bool is_shadow_section = false;
+
 		LightInstance() {}
 	};
+
+	// From project settings. Each viewpoint costs two atlas slots.
+	float line_shadow_section_length = 1.5;
+	uint32_t line_shadow_max_sections = 8;
+
+	uint32_t _line_light_shadow_sections(const Light *p_light) const;
 
 	mutable RID_Owner<LightInstance> light_instance_owner;
 
@@ -408,6 +420,10 @@ private:
 		uint32_t size = 0;
 	};
 
+public:
+	static constexpr int LINE_SHADOW_PYRAMID_LEVELS = 9;
+
+private:
 	struct ShadowAtlas {
 		struct Quadrant {
 			uint32_t subdivision = 0;
@@ -434,6 +450,11 @@ private:
 
 		RID depth;
 		RID fb; //for copying
+
+		// Min-depth pyramid that line light shadows traverse, created on first use.
+		RID line_pyramid;
+		RID line_pyramid_levels[LINE_SHADOW_PYRAMID_LEVELS];
+		int line_pyramid_level_count = 0;
 
 		HashMap<RID, uint32_t> shadow_owners;
 	};
@@ -545,6 +566,7 @@ public:
 	virtual RID light_area_get_texture(RID p_light) const override;
 
 	virtual void light_line_set_length(RID p_light, float p_length) override;
+	virtual float light_line_get_length(RID p_light) const override;
 	virtual void light_line_set_normalize_energy(RID p_light, bool p_enabled) override;
 
 	virtual RSE::LightType light_get_type(RID p_light) const override {
@@ -648,6 +670,11 @@ public:
 	virtual void light_instance_set_aabb(RID p_light_instance, const AABB &p_aabb) override;
 	virtual void light_instance_set_shadow_transform(RID p_light_instance, const Projection &p_projection, const Transform3D &p_transform, float p_far, float p_split, int p_pass, float p_shadow_texel_size, float p_bias_scale = 1.0, float p_range_begin = 0, const Vector2 &p_uv_scale = Vector2()) override;
 	virtual void light_instance_mark_visible(RID p_light_instance) override;
+
+	virtual void light_instance_update_shadow_sections(RID p_light_instance) override;
+	virtual uint32_t light_instance_get_shadow_section_count(RID p_light_instance) const override;
+	virtual RID light_instance_get_shadow_section(RID p_light_instance, uint32_t p_section) const override;
+	virtual bool light_instance_has_shadow_slot(RID p_shadow_atlas, RID p_light_instance) override { return shadow_atlas_owns_light_instance(p_shadow_atlas, p_light_instance); }
 
 	virtual bool light_instance_is_shadow_visible_at_position(RID p_light_instance, const Vector3 &p_position) const override {
 		const LightInstance *light_instance = light_instance_owner.get_or_null(p_light_instance);
@@ -1172,6 +1199,14 @@ public:
 		ERR_FAIL_UNSIGNED_INDEX_V(p_quadrant, 4, 0);
 		return atlas->quadrants[p_quadrant].subdivision;
 	}
+
+	_FORCE_INLINE_ RID shadow_atlas_get_line_pyramid(RID p_atlas) {
+		ShadowAtlas *atlas = shadow_atlas_owner.get_or_null(p_atlas);
+		ERR_FAIL_NULL_V(atlas, RID());
+		return atlas->line_pyramid;
+	}
+	// Creates the pyramid if needed. Returns its levels and their count.
+	const RID *shadow_atlas_get_line_pyramid_levels(RID p_atlas, int &r_count);
 
 	_FORCE_INLINE_ RID shadow_atlas_get_fb(RID p_atlas) {
 		ShadowAtlas *atlas = shadow_atlas_owner.get_or_null(p_atlas);

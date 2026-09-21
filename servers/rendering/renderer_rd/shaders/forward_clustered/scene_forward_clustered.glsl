@@ -3004,7 +3004,7 @@ void fragment_shader(in SceneData scene_data) {
 					continue; //not masked
 				}
 
-				light_process_line(light_index, vertex, view, normal, f0, roughness, metallic, albedo, alpha, screen_uv, energy_compensation,
+				light_process_line(light_index, vertex, view, normal, f0, roughness, metallic, scene_data.taa_frame_count, albedo, alpha, screen_uv, energy_compensation,
 #ifdef LIGHT_BACKLIGHT_USED
 						backlight,
 #endif

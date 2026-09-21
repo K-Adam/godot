@@ -7,8 +7,11 @@
 		A line light is a type of [Light3D] node that emits light from a finite line segment of zero thickness, rather than from a single point. The segment lies along the local X axis and is centered on the node's origin, so its endpoints are at [code]-line_length / 2[/code] and [code]+line_length / 2[/code]. The light is attenuated throughout the distance; this attenuation can be configured by changing the energy, [member line_attenuation] and [member line_range].
 		Unlike an [OmniLight3D], a line light emits like a cylinder: it is brightest when seen broadside and fades to nothing when seen end-on. This also makes its specular highlight a streak along the segment rather than a dot, which is what gives tube lights their characteristic look on glossy surfaces.
 		Diffuse lighting uses the exact analytic integral of the Lambertian term over the segment. Specular lighting uses Linearly Transformed Cosines (LTC), so the highlight stays correct for any roughness without approximating the light as a row of point lights.
-		[b]Note:[/b] Line lights do not cast shadows and are not supported by any GI method ([VoxelGI], [LightmapGI] or SDFGI) or by volumetric fog. The related properties are therefore hidden in the inspector.
-		[b]Performance:[/b] Line lights are more demanding on the GPU than omni and spot lights, as each one evaluates an analytic integral per pixel. In Forward+, there is an additional GPU cost on [i]all[/i] rendered objects as soon as one line light is present in the view frustum (due to the nature of clustered lighting).
+		Shadows account for how much of the segment each point can see, so a line light's penumbra stretches along the line rather than spreading in a disc the way a point or disc-shaped source would, and it hardens where a blocker meets the surface it sits on. Softness comes from the length of the segment; there is no separate blur radius. A line light is shadowed from several viewpoints spread along itself, so that its shadows stay accurate and keep their resolution over its whole length. See the [code]line_light_section_length[/code] and [code]line_light_max_sections[/code] project settings for the cost of that. [member Light3D.shadow_normal_bias] also sets how close to a surface a blocker must be before it stops casting a shadow on it; higher values are faster.
+		[b]Note:[/b] Line light shadows are supported in the Forward+ and Mobile renderers. In Compatibility, line lights render without shadows.
+		[b]Note:[/b] A mesh that encloses the light, such as a visible tube around it, must have [member GeometryInstance3D.cast_shadow] disabled, or it blocks the light entirely.
+		[b]Note:[/b] Line lights are not supported by any GI method ([VoxelGI], [LightmapGI] or SDFGI) or by volumetric fog. The related properties are therefore hidden in the inspector.
+		[b]Performance:[/b] Line lights are more demanding on the GPU than omni and spot lights, as each one evaluates an analytic integral per pixel. In Forward+, there is an additional GPU cost on [i]all[/i] rendered objects as soon as one line light is present in the view frustum (due to the nature of clustered lighting). Enabling shadows is considerably more expensive again, as each shaded pixel searches the shadow maps of several viewpoints for what hides the segment from it, so prefer to enable them only on the line lights that need them.
 	</description>
 	<tutorials>
 		<link title="3D lights and shadows">$DOCS_URL/tutorials/3d/lights_and_shadows.html</link>
@@ -27,7 +30,7 @@
 		</member>
 		<member name="line_radius" type="float" setter="set_param" getter="get_param" default="0.01">
 			The radius used to regularize the segment, in meters. A segment of zero thickness is mathematically singular where a surface touches it, which would produce infinitely bright pixels. Shading is therefore computed as if the surface were never closer to the segment than this distance, which behaves like giving the light a small tube radius.
-			Raising this value softens the light where geometry comes very close to the segment. It does [i]not[/i] control shadow softness, as line lights cast no shadows.
+			Raising this value softens the light where geometry comes very close to the segment. It does [i]not[/i] control shadow softness, which comes from the length of the segment instead.
 		</member>
 		<member name="line_range" type="float" setter="set_param" getter="get_param" default="5.0">
 			The range of the line light in meters. This determines the maximum distance from any point on the segment at which the light can still be seen.

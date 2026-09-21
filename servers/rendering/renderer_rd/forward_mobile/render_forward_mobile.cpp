@@ -628,6 +628,21 @@ RID RenderForwardMobile::_setup_render_pass_uniform_set(RenderListType p_render_
 		uniforms.push_back(u);
 	}
 
+	{
+		RD::Uniform u;
+		u.binding = 7;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID texture;
+		if (p_render_data && p_render_data->shadow_atlas.is_valid()) {
+			texture = light_storage->shadow_atlas_get_line_pyramid(p_render_data->shadow_atlas);
+		}
+		if (!texture.is_valid()) {
+			texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		}
+		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+
 	/*
 	{
 		RD::Uniform u;
@@ -823,7 +838,7 @@ void RenderForwardMobile::_pre_opaque_render(RenderDataRD *p_render_data) {
 
 			if (light_storage->light_get_type(base) == RSE::LIGHT_DIRECTIONAL) {
 				p_render_data->directional_shadows.push_back(i);
-			} else if (light_storage->light_get_type(base) == RSE::LIGHT_OMNI && light_storage->light_omni_get_shadow_mode(base) == RSE::LIGHT_OMNI_SHADOW_CUBE) {
+			} else if (light_storage->light_get_type(base) == RSE::LIGHT_LINE || (light_storage->light_get_type(base) == RSE::LIGHT_OMNI && light_storage->light_omni_get_shadow_mode(base) == RSE::LIGHT_OMNI_SHADOW_CUBE)) {
 				p_render_data->cube_shadows.push_back(i);
 			} else {
 				p_render_data->shadows.push_back(i);
@@ -1546,11 +1561,20 @@ void RenderForwardMobile::_render_shadow_pass(RID p_light, RID p_shadow_atlas, i
 
 		zfar = light_storage->light_get_param(base, RSE::LIGHT_PARAM_RANGE);
 
-		if (light_storage->light_get_type(base) == RSE::LIGHT_OMNI) {
+		if (light_storage->light_get_type(base) == RSE::LIGHT_OMNI || light_storage->light_get_type(base) == RSE::LIGHT_LINE) {
 			bool wrap = (shadow + 1) % subdivision == 0;
 			dual_paraboloid_offset = wrap ? Vector2i(1 - subdivision, 1) : Vector2i(1, 0);
 
-			if (light_storage->light_omni_get_shadow_mode(base) == RSE::LIGHT_OMNI_SHADOW_CUBE) {
+			// A line light's depth range reaches past its attenuation range. Taken from
+			// the cull pass, which worked it out placing this viewpoint's camera: the
+			// two must agree exactly or every depth comparison in the shader is scaled
+			// wrong.
+			const bool is_line = light_storage->light_get_type(base) == RSE::LIGHT_LINE;
+			if (is_line) {
+				zfar = light_storage->light_instance_get_shadow_range(p_light, 0);
+			}
+
+			if (is_line ? light_storage->light_instances_can_render_shadow_cube() : light_storage->light_omni_get_shadow_mode(base) == RSE::LIGHT_OMNI_SHADOW_CUBE) {
 				render_texture = light_storage->get_cubemap(shadow_size / 2);
 				render_fb = light_storage->get_cubemap_fb(shadow_size / 2, p_pass);
 
@@ -1614,9 +1638,21 @@ void RenderForwardMobile::_render_shadow_pass(RID p_light, RID p_shadow_atlas, i
 			Rect2 atlas_rect_norm = atlas_rect;
 			atlas_rect_norm.position /= float(atlas_size);
 			atlas_rect_norm.size /= float(atlas_size);
-			copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, false);
+			const bool polar = light_storage->light_get_type(base) == RSE::LIGHT_LINE;
+			copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, false, polar);
 			atlas_rect_norm.position += Vector2(dual_paraboloid_offset) * atlas_rect_norm.size;
-			copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, true);
+			copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, true, polar);
+			if (polar) {
+				int level_count = 0;
+				const RID *levels = light_storage->shadow_atlas_get_line_pyramid_levels(p_shadow_atlas, level_count);
+				if (levels) {
+					RID atlas_texture = light_storage->shadow_atlas_get_texture(p_shadow_atlas);
+					// Only levels no coarser than the slot are ever read.
+					level_count = MIN(level_count, (int)Math::floor_log2((uint32_t)atlas_rect.size.width) - 1);
+					copy_effects->build_line_shadow_pyramid(atlas_texture, levels, level_count, atlas_rect);
+					copy_effects->build_line_shadow_pyramid(atlas_texture, levels, level_count, Rect2i(atlas_rect.position + dual_paraboloid_offset * atlas_rect.size, atlas_rect.size));
+				}
+			}
 
 			//restore transform so it can be properly used
 			light_storage->light_instance_set_shadow_transform(p_light, Projection(), light_storage->light_instance_get_base_transform(p_light), zfar, 0, 0, 0);

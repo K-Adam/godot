@@ -108,6 +108,7 @@ public:
 	virtual RID light_area_get_texture(RID p_light) const override { return RID(); }
 
 	virtual void light_line_set_length(RID p_light, float p_length) override {}
+	virtual float light_line_get_length(RID p_light) const override { return 0.0f; }
 	virtual void light_line_set_normalize_energy(RID p_light, bool p_enabled) override {}
 
 	virtual bool light_has_shadow(RID p_light) const override { return false; }

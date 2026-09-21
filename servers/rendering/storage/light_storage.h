@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "core/math/transform_3d.h"
 #include "servers/rendering/rendering_server_enums.h"
 #include "servers/rendering/storage/render_scene_buffers.h"
 
@@ -90,7 +91,43 @@ public:
 	virtual RID light_area_get_texture(RID p_light) const = 0;
 
 	virtual void light_line_set_length(RID p_light, float p_length) = 0;
+	virtual float light_line_get_length(RID p_light) const = 0;
 	virtual void light_line_set_normalize_energy(RID p_light, bool p_enabled) = 0;
+
+	// Line light shadow frame: local X (the segment) rotated onto Z. Every site building
+	// a line light's shadow camera or matrix must use this.
+	static _FORCE_INLINE_ Transform3D line_light_shadow_transform(const Transform3D &p_light_transform) {
+		return Transform3D(p_light_transform.basis * Basis(Vector3(0, 1, 0), Math::PI / 2), p_light_transform.origin);
+	}
+
+	// Up to 16 sections, so at most 17 viewpoints.
+	static constexpr uint32_t LINE_LIGHT_MAX_VIEWPOINTS = 17;
+
+	// Viewpoints sit at both ends and evenly between; a single one sits at the middle.
+	// Viewpoint 0 is the light instance itself.
+	static _FORCE_INLINE_ void line_light_shadow_viewpoint(float p_length, uint32_t p_count, uint32_t p_index, float &r_offset, float &r_spacing) {
+		if (p_count <= 1) {
+			r_offset = 0.0;
+			r_spacing = p_length;
+		} else {
+			r_spacing = p_length / float(p_count - 1);
+			r_offset = -p_length * 0.5 + float(p_index) * r_spacing;
+		}
+	}
+
+	// How far beyond the light's range a viewpoint has to see; shared by all viewpoints
+	// so the shader uses one depth scale.
+	static _FORCE_INLINE_ float line_light_shadow_extent(float p_length, uint32_t p_count) {
+		return p_count <= 1 ? p_length * 0.5f : p_length;
+	}
+
+	virtual void light_instance_update_shadow_sections(RID p_light_instance) {}
+	virtual uint32_t light_instance_get_shadow_section_count(RID p_light_instance) const { return 1; }
+	virtual RID light_instance_get_shadow_section(RID p_light_instance, uint32_t p_section) const { return p_light_instance; }
+
+	// A section can lose the race for an atlas slot when the atlas is full, leaving
+	// nothing to render it into.
+	virtual bool light_instance_has_shadow_slot(RID p_shadow_atlas, RID p_light_instance) { return true; }
 
 	virtual bool light_has_shadow(RID p_light) const = 0;
 

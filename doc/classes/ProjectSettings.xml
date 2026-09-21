@@ -3223,6 +3223,13 @@
 		<member name="rendering/lights_and_shadows/positional_shadow/atlas_size.mobile" type="int" setter="" getter="" default="2048">
 			Lower-end override for [member rendering/lights_and_shadows/positional_shadow/atlas_size] on mobile devices, due to performance concerns or driver support.
 		</member>
+		<member name="rendering/lights_and_shadows/positional_shadow/line_light_max_sections" type="int" setter="" getter="" default="8">
+			The largest number of sections a single [LineLight3D]'s shadows may be split into. See [member rendering/lights_and_shadows/positional_shadow/line_light_section_length]. A light with [code]n[/code] sections is shadowed from [code]n + 1[/code] viewpoints, each taking two slots of the shadow atlas, so this bounds how much of the atlas one long light can claim from the rest of the scene.
+		</member>
+		<member name="rendering/lights_and_shadows/positional_shadow/line_light_section_length" type="float" setter="" getter="" default="1.5">
+			The largest distance, in meters, between two of a [LineLight3D]'s shadow viewpoints. A line light is shadowed from viewpoints at both of its ends and evenly spaced between them, no further apart than this, and near the light each part of the segment is checked from the two viewpoints either side of it. A light cut into [code]n[/code] sections has [code]n + 1[/code] viewpoints and takes [code]2(n + 1)[/code] shadow atlas slots. Shorter sections give more accurate shadows, most visibly from thin blockers, on glossy surfaces and on long lights. A light shorter than a tenth of this is shadowed from a single viewpoint at its center.
+			The number of sections is capped by [member rendering/lights_and_shadows/positional_shadow/line_light_max_sections]. Once a light reaches that cap its sections grow longer instead, and its shadows get less accurate towards the middle of each one.
+		</member>
 		<member name="rendering/lights_and_shadows/positional_shadow/soft_shadow_filter_quality" type="int" setter="" getter="" default="2">
 			Quality setting for shadows cast by [OmniLight3D]s and [SpotLight3D]s. Higher quality settings use more samples when reading from shadow maps and are thus slower. Low quality settings may result in shadows looking grainy.
 			[b]Note:[/b] The [b]Soft Very Low[/b] option will automatically multiply all [i]constant[/i] shadow blur by [code]0.75[/code] to reduce the amount of noticeable noise. This automatic blur change only affects the constant blur factor defined in [member Light3D.shadow_blur], not the variable blur performed by [DirectionalLight3D]'s [member Light3D.light_angular_distance].

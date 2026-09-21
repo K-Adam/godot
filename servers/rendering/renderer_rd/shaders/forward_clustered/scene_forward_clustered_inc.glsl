@@ -405,6 +405,8 @@ layout(set = 1, binding = 3) uniform texture2D radiance_octmap;
 layout(set = 1, binding = 4) uniform texture2DArray reflection_atlas;
 
 layout(set = 1, binding = 5) uniform texture2D shadow_atlas;
+// Min-depth pyramid over the shadow atlas, for line light shadows.
+layout(set = 1, binding = 39) uniform texture2D line_shadow_pyramid;
 
 layout(set = 1, binding = 6) uniform texture2D directional_shadow_atlas;
 

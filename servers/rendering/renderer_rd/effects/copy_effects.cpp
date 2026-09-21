@@ -146,16 +146,29 @@ CopyEffects::CopyEffects(BitField<RasterEffects> p_raster_effects) {
 		// Initialize copier
 		Vector<String> copy_modes;
 		copy_modes.push_back("\n");
+		copy_modes.push_back("\n#define MODE_POLAR\n");
 
 		cube_to_dp.shader.initialize(copy_modes);
 
 		cube_to_dp.shader_version = cube_to_dp.shader.version_create();
-		RID shader = cube_to_dp.shader.version_get_shader(cube_to_dp.shader_version, 0);
 		RD::PipelineDepthStencilState dss;
 		dss.enable_depth_test = true;
 		dss.depth_compare_operator = RD::COMPARE_OP_ALWAYS;
 		dss.enable_depth_write = true;
-		cube_to_dp.pipeline.setup(shader, RD::RENDER_PRIMITIVE_TRIANGLES, RD::PipelineRasterizationState(), RD::PipelineMultisampleState(), dss, RD::PipelineColorBlendState(), 0);
+		cube_to_dp.pipeline.setup(cube_to_dp.shader.version_get_shader(cube_to_dp.shader_version, 0), RD::RENDER_PRIMITIVE_TRIANGLES, RD::PipelineRasterizationState(), RD::PipelineMultisampleState(), dss, RD::PipelineColorBlendState(), 0);
+		cube_to_dp.pipeline_polar.setup(cube_to_dp.shader.version_get_shader(cube_to_dp.shader_version, 1), RD::RENDER_PRIMITIVE_TRIANGLES, RD::PipelineRasterizationState(), RD::PipelineMultisampleState(), dss, RD::PipelineColorBlendState(), 0);
+	}
+
+	{
+		Vector<String> pyramid_modes;
+		pyramid_modes.push_back("\n#define MODE_FROM_ATLAS\n");
+		pyramid_modes.push_back("\n");
+
+		line_shadow_pyramid.shader.initialize(pyramid_modes);
+		line_shadow_pyramid.shader_version = line_shadow_pyramid.shader.version_create();
+		for (int i = 0; i < 2; i++) {
+			line_shadow_pyramid.pipelines[i].create_compute_pipeline(line_shadow_pyramid.shader.version_get_shader(line_shadow_pyramid.shader_version, i));
+		}
 	}
 
 	{
@@ -392,6 +405,10 @@ CopyEffects::~CopyEffects() {
 
 	copy_to_fb.shader.version_free(copy_to_fb.shader_version);
 	cube_to_dp.shader.version_free(cube_to_dp.shader_version);
+	for (int i = 0; i < 2; i++) {
+		line_shadow_pyramid.pipelines[i].free();
+	}
+	line_shadow_pyramid.shader.version_free(line_shadow_pyramid.shader_version);
 	cube_to_octmap.shader.version_free(cube_to_octmap.shader_version);
 
 	singleton = nullptr;
@@ -1077,7 +1094,7 @@ void CopyEffects::set_color_raster(RID p_dest_texture, const Color &p_color, con
 	RD::get_singleton()->draw_list_end();
 }
 
-void CopyEffects::copy_cubemap_to_dp(RID p_source_rd_texture, RID p_dst_framebuffer, const Rect2 &p_rect, const Vector2 &p_dst_size, float p_z_near, float p_z_far, bool p_dp_flip) {
+void CopyEffects::copy_cubemap_to_dp(RID p_source_rd_texture, RID p_dst_framebuffer, const Rect2 &p_rect, const Vector2 &p_dst_size, float p_z_near, float p_z_far, bool p_dp_flip, bool p_polar) {
 	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
 	ERR_FAIL_NULL(uniform_set_cache);
 	MaterialStorage *material_storage = MaterialStorage::get_singleton();
@@ -1099,21 +1116,61 @@ void CopyEffects::copy_cubemap_to_dp(RID p_source_rd_texture, RID p_dst_framebuf
 	push_constant.texel_size[0] *= p_dp_flip ? -1.0f : 1.0f; // Encode dp flip as x size sign
 
 	// setup our uniforms
-	RID default_sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	// Polar maps are read as geometry: filtering would invent depths between a silhouette and what lies behind it.
+	RID default_sampler = material_storage->sampler_rd_get_default(p_polar ? RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST : RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 
 	RD::Uniform u_source_rd_texture(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, p_source_rd_texture }));
 
-	RID shader = cube_to_dp.shader.version_get_shader(cube_to_dp.shader_version, 0);
+	RID shader = cube_to_dp.shader.version_get_shader(cube_to_dp.shader_version, p_polar ? 1 : 0);
 	ERR_FAIL_COND(shader.is_null());
 
+	PipelineCacheRD &pipeline = p_polar ? cube_to_dp.pipeline_polar : cube_to_dp.pipeline;
 	RD::DrawListID draw_list = RD::get_singleton()->draw_list_begin(p_dst_framebuffer, RD::DRAW_DEFAULT_ALL, Vector<Color>(), 1.0f, 0, screen_rect);
-	RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, cube_to_dp.pipeline.get_render_pipeline(RD::INVALID_ID, RD::get_singleton()->framebuffer_get_format(p_dst_framebuffer)));
+	RD::get_singleton()->draw_list_bind_render_pipeline(draw_list, pipeline.get_render_pipeline(RD::INVALID_ID, RD::get_singleton()->framebuffer_get_format(p_dst_framebuffer)));
 	RD::get_singleton()->draw_list_bind_uniform_set(draw_list, uniform_set_cache->get_cache(shader, 0, u_source_rd_texture), 0);
 	RD::get_singleton()->draw_list_bind_index_array(draw_list, material_storage->get_quad_index_array());
 
 	RD::get_singleton()->draw_list_set_push_constant(draw_list, &push_constant, sizeof(CopyToDPPushConstant));
 	RD::get_singleton()->draw_list_draw(draw_list, true);
 	RD::get_singleton()->draw_list_end();
+}
+
+void CopyEffects::build_line_shadow_pyramid(RID p_atlas, const RID *p_levels, int p_level_count, const Rect2i &p_rect) {
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	ERR_FAIL_NULL(uniform_set_cache);
+	MaterialStorage *material_storage = MaterialStorage::get_singleton();
+	ERR_FAIL_NULL(material_storage);
+
+	RID sampler = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+
+	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
+	for (int level = 0; level < p_level_count; level++) {
+		// Every texel of this level that the rect touches.
+		const int shift = level + 2;
+		const Point2i from = Point2i(p_rect.position.x >> shift, p_rect.position.y >> shift);
+		const Point2i to = Point2i((p_rect.position.x + p_rect.size.x + (1 << shift) - 1) >> shift, (p_rect.position.y + p_rect.size.y + (1 << shift) - 1) >> shift);
+
+		const int mode = level == 0 ? 0 : 1;
+		RID shader = line_shadow_pyramid.shader.version_get_shader(line_shadow_pyramid.shader_version, mode);
+		ERR_FAIL_COND(shader.is_null());
+
+		RD::Uniform u_source = level == 0 ? RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, p_atlas })) : RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 0, p_levels[level - 1]);
+		RD::Uniform u_dest(RD::UNIFORM_TYPE_IMAGE, 0, p_levels[level]);
+
+		LineShadowPyramidPushConstant push_constant;
+		push_constant.offset[0] = from.x;
+		push_constant.offset[1] = from.y;
+		push_constant.size[0] = to.x - from.x;
+		push_constant.size[1] = to.y - from.y;
+
+		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, line_shadow_pyramid.pipelines[mode].get_rid());
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 0, u_source), 0);
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 1, u_dest), 1);
+		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(LineShadowPyramidPushConstant));
+		RD::get_singleton()->compute_list_dispatch_threads(compute_list, push_constant.size[0], push_constant.size[1], 1);
+		RD::get_singleton()->compute_list_add_barrier(compute_list);
+	}
+	RD::get_singleton()->compute_list_end();
 }
 
 void CopyEffects::copy_cubemap_to_octmap(RID p_source_rd_texture, RID p_dst_framebuffer, float p_border_size) {

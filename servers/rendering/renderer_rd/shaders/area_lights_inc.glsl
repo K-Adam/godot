@@ -236,33 +236,49 @@ float line_measure(vec3 p1, vec3 p2, float min_distance) {
 	return (l2 / sqrt(d * d + l2 * l2) - l1 / sqrt(d * d + l1 * l1)) / d;
 }
 
+// How much the cosine-space transform rescales the segment's projected width:
+// 1 / |M_inv^-T * normalize(cross(p1, p2))|, rewritten with
+// cross(M a, M b) == det(M) * M^-T cross(a, b) to avoid a matrix inverse. Also
+// the factor by which distances grow under the transform, so anything sampling
+// the transformed segment must regularize with the same `w * min_radius`.
+// Returns 0 when the segment is collinear with the shading point.
+float ltc_line_width_factor(mat3 M_inv, vec3 p1, vec3 p2) {
+	float cm_len = length(cross(M_inv * p1, M_inv * p2));
+	float c_len = length(cross(p1, p2));
+	// Ordered so a zero or NaN on either side falls out as 0 rather than
+	// propagating: with the shading point on the line both lengths are zero.
+	return cm_len > 1e-6 * c_len ? abs(determinant(M_inv)) * c_len / cm_len : 0.0;
+}
+
+// Takes light vectors from shading space into the cosine space the LTC lobe is
+// defined in, with the shading normal on +Y. Split out so the shadow estimator
+// can weight samples with the same density the closed form below integrates.
+mat3 ltc_line_cos_xform(vec3 normal, vec3 eye_vec, mat3 M_inv) {
+	// Orthonormal basis around the normal, matching ltc_evaluate().
+	vec3 z = -normalize(eye_vec - normal * dot(eye_vec, normal));
+	vec3 x = cross(normal, z);
+	return M_inv * transpose(mat3(x, normal, z));
+}
+
 // LTC integral over a line: transform the endpoints, integrate as a clamped
 // cosine, then correct for how the transform rescales the segment's width.
 // The diffuse case is M_inv == identity, where the width factor is exactly 1;
 // call line_integrate_diffuse() directly with the shading normal instead.
-float ltc_evaluate_line_transformed(mat3 M_inv, vec3 p1, vec3 p2, float min_radius) {
-	vec3 l1 = M_inv * p1;
-	vec3 l2 = M_inv * p2;
-
-	// Width factor 1 / |M_inv^-T * normalize(cross(p1, p2))|, rewritten with
-	// cross(M a, M b) == det(M) * M^-T cross(a, b) to avoid a matrix inverse.
-	vec3 cm = cross(l1, l2);
-	float cm_len = length(cm);
-	float c_len = length(cross(p1, p2));
-	if (cm_len < 1e-6 * c_len) {
-		return 0.0; // Segment is collinear with the shading point.
+float ltc_evaluate_line_transformed(mat3 M_inv, vec3 p1, vec3 p2, float min_radius, float w) {
+	if (w <= 0.0) {
+		return 0.0;
 	}
-	float w = abs(determinant(M_inv)) * c_len / cm_len;
 
 	// The same physical radius is a w times larger distance after the transform.
-	return w * line_integrate_diffuse(l1, l2, vec3(0.0, 1.0, 0.0), w * min_radius);
+	return w * line_integrate_diffuse(M_inv * p1, M_inv * p2, vec3(0.0, 1.0, 0.0), w * min_radius);
+}
+
+float ltc_evaluate_line_transformed(mat3 M_inv, vec3 p1, vec3 p2, float min_radius) {
+	return ltc_evaluate_line_transformed(M_inv, p1, p2, min_radius, ltc_line_width_factor(M_inv, p1, p2));
 }
 
 float ltc_evaluate_line(vec3 normal, vec3 eye_vec, mat3 M_inv, vec3 p1, vec3 p2, float min_radius) {
-	// Orthonormal basis around the normal, matching ltc_evaluate().
-	vec3 z = -normalize(eye_vec - normal * dot(eye_vec, normal));
-	vec3 x = cross(normal, z);
-	return ltc_evaluate_line_transformed(M_inv * transpose(mat3(x, normal, z)), p1, p2, min_radius);
+	return ltc_evaluate_line_transformed(ltc_line_cos_xform(normal, eye_vec, M_inv), p1, p2, min_radius);
 }
 
 void ltc_evaluate_line_specular(vec3 normal, vec3 eye_vec, float roughness, vec3 p1, vec3 p2, float min_radius, sampler lut_sampler, texture2D ltc_lut1, texture2D ltc_lut2, out float ltc_specular, out vec2 fresnel) {
@@ -358,7 +374,9 @@ mat3 ltc_matrix_anisotropic(vec3 normal, vec3 tangent, vec3 binormal, vec3 eye_v
 	return mat3(m_inv[0].xzy, m_inv[1].xzy, m_inv[2].xzy) * transpose(mat3(tangent, binormal, normal));
 }
 
-void ltc_evaluate_line_specular_anisotropic(vec3 normal, vec3 tangent, vec3 binormal, vec3 eye_vec, float roughness, float anisotropy, vec3 p1, vec3 p2, float min_radius, sampler lut_sampler, texture2D ltc_lut2, texture3D ltc_lut_aniso, out float ltc_specular, out vec2 fresnel) {
+// Anisotropic counterpart of ltc_line_cos_xform(). ltc_matrix_anisotropic()
+// already returns the full transform, so there is no basis to compose here.
+mat3 ltc_line_cos_xform_anisotropic(vec3 normal, vec3 tangent, vec3 binormal, vec3 eye_vec, float roughness, float anisotropy, sampler lut_sampler, texture2D ltc_lut2, texture3D ltc_lut_aniso, out vec2 fresnel) {
 	// Only the shape of the lobe is anisotropic here: an LTC is invariant to a
 	// uniform scale of its matrix, so all of the energy still comes from the
 	// isotropic table, which is also the only one that carries Fresnel. Both
@@ -372,11 +390,9 @@ void ltc_evaluate_line_specular_anisotropic(vec3 normal, vec3 tangent, vec3 bino
 	// slightly on the lobe's aspect ratio, which is the price of an 8^4 table.
 	float alpha = roughness * roughness;
 	float aspect = sqrt(1.0 - anisotropy * 0.9);
-	mat3 M_inv = ltc_matrix_anisotropic(normal, tangent, binormal, eye_vec, theta,
+	return ltc_matrix_anisotropic(normal, tangent, binormal, eye_vec, theta,
 			clamp(alpha / aspect, 0.001, 1.0), clamp(alpha * aspect, 0.001, 1.0),
 			lut_sampler, ltc_lut_aniso);
-
-	ltc_specular = ltc_evaluate_line_transformed(M_inv, p1, p2, min_radius);
 }
 
 #endif // LIGHT_ANISOTROPY_USED

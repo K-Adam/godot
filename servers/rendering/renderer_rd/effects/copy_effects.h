@@ -37,6 +37,7 @@
 #include "servers/rendering/renderer_rd/shaders/effects/copy_to_fb.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/cube_to_dp.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/cube_to_octmap.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/line_shadow_pyramid.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/octmap_downsampler.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/octmap_downsampler_raster.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/octmap_filter.glsl.gen.h"
@@ -228,6 +229,7 @@ private:
 		CubeToDpShaderRD shader;
 		RID shader_version;
 		PipelineCacheRD pipeline;
+		PipelineCacheRD pipeline_polar;
 	} cube_to_dp;
 
 	// Copy to Octmap
@@ -243,6 +245,19 @@ private:
 		RID shader_version;
 		PipelineCacheRD pipeline;
 	} cube_to_octmap;
+
+	// Line light shadow pyramid
+
+	struct LineShadowPyramidPushConstant {
+		int32_t offset[2];
+		int32_t size[2];
+	};
+
+	struct LineShadowPyramid {
+		LineShadowPyramidShaderRD shader;
+		RID shader_version;
+		PipelineDeferredRD pipelines[2];
+	} line_shadow_pyramid;
 
 	// Octmap effects
 
@@ -386,8 +401,9 @@ public:
 	void set_color(RID p_dest_texture, const Color &p_color, const Rect2i &p_region, bool p_8bit_dst = false);
 	void set_color_raster(RID p_dest_texture, const Color &p_color, const Rect2i &p_region);
 
-	void copy_cubemap_to_dp(RID p_source_rd_texture, RID p_dst_framebuffer, const Rect2 &p_rect, const Vector2 &p_dst_size, float p_z_near, float p_z_far, bool p_dp_flip);
+	void copy_cubemap_to_dp(RID p_source_rd_texture, RID p_dst_framebuffer, const Rect2 &p_rect, const Vector2 &p_dst_size, float p_z_near, float p_z_far, bool p_dp_flip, bool p_polar = false);
 	void copy_cubemap_to_octmap(RID p_source_rd_texture, RID p_dst_framebuffer, float p_border_size);
+	void build_line_shadow_pyramid(RID p_atlas, const RID *p_levels, int p_level_count, const Rect2i &p_rect);
 	void octmap_downsample(RID p_source_octmap, RID p_dest_octmap, const Size2i &p_size, float p_border_size);
 	void octmap_downsample_raster(RID p_source_octmap, RID p_dest_framebuffer, const Size2i &p_size, float p_border_size);
 	void octmap_filter(RID p_source_octmap, const Vector<RID> &p_dest_octmap, bool p_use_array, float p_border_size);

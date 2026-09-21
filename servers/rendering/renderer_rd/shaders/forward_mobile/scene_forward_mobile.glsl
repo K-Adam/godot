@@ -2337,7 +2337,7 @@ void main() {
 			break;
 		}
 
-		light_process_line(light_index, vertex, view, normal, f0, roughness, metallic, albedo, alpha, screen_uv, hvec3(1.0),
+		light_process_line(light_index, vertex, view, normal, f0, roughness, metallic, scene_data.taa_frame_count, albedo, alpha, screen_uv, hvec3(1.0),
 #ifdef LIGHT_BACKLIGHT_USED
 				backlight,
 #endif

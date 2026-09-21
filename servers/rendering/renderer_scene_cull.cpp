@@ -1817,8 +1817,8 @@ void RendererSceneCull::_update_instance(Instance *p_instance) const {
 				idata.instance_data_rid = light_data->instance.get_id();
 				light_data->uses_projector = RSG::light_storage->light_has_projector(p_instance->base);
 				const RSE::LightType light_type = RSG::light_storage->light_get_type(p_instance->base);
-				// A line light's LIGHT_PARAM_SIZE is a regularization radius rather than
-				// a shadow softness, and line lights cast no shadows at all.
+				// A line light's LIGHT_PARAM_SIZE is a regularization radius, not a shadow
+				// softness, so it must not switch on the PCSS variants.
 				light_data->uses_softshadow = light_type == RSE::LIGHT_AREA ||
 						(light_type != RSE::LIGHT_LINE && RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_SIZE) > CMP_EPSILON);
 			} break;
@@ -2395,7 +2395,7 @@ void RendererSceneCull::_light_instance_setup_directional_shadow(int p_shadow_in
 	}
 }
 
-bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect, RID p_shadow_atlas, Scenario *p_scenario, float p_screen_mesh_lod_threshold, uint32_t p_visible_layers) {
+bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, const Transform3D p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, bool p_cam_vaspect, RID p_shadow_atlas, Scenario *p_scenario, float p_screen_mesh_lod_threshold, uint32_t p_visible_layers, uint32_t p_section) {
 	InstanceLightData *light = static_cast<InstanceLightData *>(p_instance->base_data);
 
 	Transform3D light_transform = p_instance->transform;
@@ -2405,10 +2405,6 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 
 	switch (RSG::light_storage->light_get_type(p_instance->base)) {
 		case RSE::LIGHT_DIRECTIONAL: {
-		} break;
-		case RSE::LIGHT_LINE: {
-			// Line lights cast no shadows; light_set_shadow() keeps them out of
-			// the shadow atlas, so this is unreachable in practice.
 		} break;
 		case RSE::LIGHT_OMNI: {
 			RSE::LightOmniShadowMode shadow_mode = RSG::light_storage->light_omni_get_shadow_mode(p_instance->base);
@@ -2700,7 +2696,121 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 			RSG::light_storage->light_instance_set_shadow_transform(light->instance, Projection(), light_transform, radius, 0, 0, 0);
 			shadow_data.light = light->instance;
 			shadow_data.pass = 0;
-		}
+		} break;
+		case RSE::LIGHT_LINE: {
+			// Rendered as six perspective faces, then resolved into the polar layout
+			// the shader walks. Every backend that shadows line lights renders cubes.
+			const bool cube = RSG::light_storage->light_instances_can_render_shadow_cube();
+			const int passes = cube ? 6 : 2;
+			if (max_shadows_used + passes > MAX_UPDATE_SHADOWS) {
+				return true;
+			}
+
+			real_t range = RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_RANGE);
+			real_t length = RSG::light_storage->light_line_get_length(p_instance->base);
+			uint32_t sections = RSG::light_storage->light_instance_get_shadow_section_count(light->instance);
+			RID section_instance = RSG::light_storage->light_instance_get_shadow_section(light->instance, p_section);
+
+			float offset;
+			float spacing;
+			RendererLightStorage::line_light_shadow_viewpoint(length, sections, p_section, offset, spacing);
+			real_t radius = range + RendererLightStorage::line_light_shadow_extent(length, sections);
+
+			// This viewpoint sits `offset` along the shadow frame's Z axis. `radius`
+			// reaches everything between a receiver in range and the segment.
+			Transform3D dp_transform = RendererLightStorage::line_light_shadow_transform(light_transform);
+			dp_transform.origin += dp_transform.basis.get_column(2) * offset;
+
+			Projection cm;
+			if (cube) {
+				cm.set_perspective(90, 1, MIN(0.025f, radius), radius);
+			}
+
+			static const Vector3 view_normals[6] = {
+				Vector3(+1, 0, 0),
+				Vector3(-1, 0, 0),
+				Vector3(0, -1, 0),
+				Vector3(0, +1, 0),
+				Vector3(0, 0, +1),
+				Vector3(0, 0, -1)
+			};
+			static const Vector3 view_up[6] = {
+				Vector3(0, -1, 0),
+				Vector3(0, -1, 0),
+				Vector3(0, 0, -1),
+				Vector3(0, 0, +1),
+				Vector3(0, -1, 0),
+				Vector3(0, -1, 0)
+			};
+
+			for (int i = 0; i < passes; i++) {
+				RENDER_TIMESTAMP("Cull LineLight3D Shadow, Viewpoint " + itos(p_section) + " Pass " + itos(i));
+
+				Transform3D xform = dp_transform;
+				Vector<Plane> planes;
+				if (cube) {
+					xform = dp_transform * Transform3D().looking_at(view_normals[i], view_up[i]);
+					planes = cm.get_projection_planes(xform);
+				} else {
+					real_t z = i == 0 ? -1 : 1;
+					planes.resize(6);
+					planes.write[0] = dp_transform.xform(Plane(Vector3(0, 0, z), radius));
+					planes.write[1] = dp_transform.xform(Plane(Vector3(1, 0, z).normalized(), radius));
+					planes.write[2] = dp_transform.xform(Plane(Vector3(-1, 0, z).normalized(), radius));
+					planes.write[3] = dp_transform.xform(Plane(Vector3(0, 1, z).normalized(), radius));
+					planes.write[4] = dp_transform.xform(Plane(Vector3(0, -1, z).normalized(), radius));
+					planes.write[5] = dp_transform.xform(Plane(Vector3(0, 0, -z), 0));
+				}
+
+				instance_shadow_cull_result.clear();
+
+				Vector<Vector3> points = Geometry3D::compute_convex_mesh_points(&planes[0], planes.size());
+
+				struct CullConvex {
+					PagedArray<Instance *> *result;
+					_FORCE_INLINE_ bool operator()(void *p_data) {
+						Instance *p_instance = (Instance *)p_data;
+						result->push_back(p_instance);
+						return false;
+					}
+				};
+
+				CullConvex cull_convex;
+				cull_convex.result = &instance_shadow_cull_result;
+
+				p_scenario->indexers[Scenario::INDEXER_GEOMETRY].convex_query(planes.ptr(), planes.size(), points.ptr(), points.size(), cull_convex);
+
+				RendererSceneRender::RenderShadowData &shadow_data = render_shadow_data[max_shadows_used++];
+
+				if (!light->is_shadow_update_full()) {
+					light_culler->cull_regular_light(instance_shadow_cull_result);
+				}
+
+				for (int j = 0; j < (int)instance_shadow_cull_result.size(); j++) {
+					Instance *instance = instance_shadow_cull_result[j];
+					const bool is_inactive_particle = (instance->base_type == RSE::INSTANCE_PARTICLES) && RSG::particles_storage->particles_is_inactive(instance->base);
+					if (!instance->visible || !((1 << instance->base_type) & RSE::INSTANCE_GEOMETRY_MASK) || !static_cast<InstanceGeometryData *>(instance->base_data)->can_cast_shadows || !(p_visible_layers & instance->layer_mask & RSG::light_storage->light_get_shadow_caster_mask(p_instance->base)) || is_inactive_particle) {
+						continue;
+					} else {
+						if (static_cast<InstanceGeometryData *>(instance->base_data)->material_is_animated) {
+							animated_material_found = true;
+						}
+
+						if (instance->mesh_instance.is_valid()) {
+							RSG::mesh_storage->mesh_instance_check_for_update(instance->mesh_instance);
+						}
+					}
+
+					shadow_data.instances.push_back(static_cast<InstanceGeometryData *>(instance->base_data)->geometry_instance);
+				}
+
+				RSG::mesh_storage->update_mesh_instances();
+
+				RSG::light_storage->light_instance_set_shadow_transform(section_instance, cm, xform, radius, 0, i, 0);
+				shadow_data.light = section_instance;
+				shadow_data.pass = i;
+			}
+		} break;
 	}
 
 	return animated_material_found;
@@ -3497,44 +3607,52 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 
 			InstanceLightData *light = static_cast<InstanceLightData *>(ins->base_data);
 
+			// Before the early-out, so a light that stopped casting shadows frees its sections.
+			RSG::light_storage->light_instance_update_shadow_sections(light->instance);
+
 			if (!RSG::light_storage->light_instance_is_shadow_visible_at_position(light->instance, camera_position)) {
 				continue;
 			}
 
 			float coverage = 0.f;
 
+			Transform3D cam_xf = p_camera_data->main_transform;
+			float zn = p_camera_data->main_projection.get_z_near();
+			Plane p(-cam_xf.basis.get_column(2), cam_xf.origin + cam_xf.basis.get_column(2) * -zn); //camera near plane
+
+			// near plane half width and height
+			Vector2 vp_half_extents = p_camera_data->main_projection.get_viewport_half_extents();
+
+			// How much of the screen a sphere of this radius at this point covers,
+			// which is what picks the light's resolution tier in the shadow atlas.
+			auto coverage_of = [&](const Vector3 &p_origin, float p_radius) {
+				//get two points parallel to near plane
+				Vector3 points[2] = {
+					p_origin,
+					p_origin + cam_xf.basis.get_column(0) * p_radius
+				};
+
+				if (!p_camera_data->is_orthogonal) {
+					//if using perspetive, map them to near plane
+					for (int j = 0; j < 2; j++) {
+						if (p.distance_to(points[j]) < 0) {
+							points[j].z = -zn; //small hack to keep size constant when hitting the screen
+						}
+
+						p.intersects_segment(cam_xf.origin, points[j], &points[j]); //map to plane
+					}
+				}
+
+				float screen_diameter = points[0].distance_to(points[1]) * 2;
+				return screen_diameter / (vp_half_extents.x + vp_half_extents.y);
+			};
+
 			{ //compute coverage
-
-				Transform3D cam_xf = p_camera_data->main_transform;
-				float zn = p_camera_data->main_projection.get_z_near();
-				Plane p(-cam_xf.basis.get_column(2), cam_xf.origin + cam_xf.basis.get_column(2) * -zn); //camera near plane
-
-				// near plane half width and height
-				Vector2 vp_half_extents = p_camera_data->main_projection.get_viewport_half_extents();
-
 				switch (RSG::light_storage->light_get_type(ins->base)) {
 					case RSE::LIGHT_OMNI: {
 						float radius = RSG::light_storage->light_get_param(ins->base, RSE::LIGHT_PARAM_RANGE);
 
-						//get two points parallel to near plane
-						Vector3 points[2] = {
-							ins->transform.origin,
-							ins->transform.origin + cam_xf.basis.get_column(0) * radius
-						};
-
-						if (!p_camera_data->is_orthogonal) {
-							//if using perspetive, map them to near plane
-							for (int j = 0; j < 2; j++) {
-								if (p.distance_to(points[j]) < 0) {
-									points[j].z = -zn; //small hack to keep size constant when hitting the screen
-								}
-
-								p.intersects_segment(cam_xf.origin, points[j], &points[j]); //map to plane
-							}
-						}
-
-						float screen_diameter = points[0].distance_to(points[1]) * 2;
-						coverage = screen_diameter / (vp_half_extents.x + vp_half_extents.y);
+						coverage = coverage_of(ins->transform.origin, radius);
 					} break;
 					case RSE::LIGHT_SPOT: {
 						float radius = RSG::light_storage->light_get_param(ins->base, RSE::LIGHT_PARAM_RANGE);
@@ -3544,50 +3662,17 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 						float d = radius * Math::cos(Math::deg_to_rad(angle));
 
 						Vector3 base = ins->transform.origin - ins->transform.basis.get_column(2).normalized() * d;
-
-						Vector3 points[2] = {
-							base,
-							base + cam_xf.basis.get_column(0) * w
-						};
-
-						if (!p_camera_data->is_orthogonal) {
-							//if using perspetive, map them to near plane
-							for (int j = 0; j < 2; j++) {
-								if (p.distance_to(points[j]) < 0) {
-									points[j].z = -zn; //small hack to keep size constant when hitting the screen
-								}
-
-								p.intersects_segment(cam_xf.origin, points[j], &points[j]); //map to plane
-							}
-						}
-
-						float screen_diameter = points[0].distance_to(points[1]) * 2;
-						coverage = screen_diameter / (vp_half_extents.x + vp_half_extents.y);
-
+						coverage = coverage_of(base, w);
 					} break;
 					case RSE::LIGHT_AREA: {
 						float diagonal = RSG::light_storage->light_area_get_size(ins->base).length();
 						float radius = RSG::light_storage->light_get_param(ins->base, RSE::LIGHT_PARAM_RANGE) + diagonal;
 
-						//get two points parallel to near plane
-						Vector3 points[2] = {
-							ins->transform.origin,
-							ins->transform.origin + cam_xf.basis.get_column(0) * radius
-						};
-
-						if (!p_camera_data->is_orthogonal) {
-							//if using perspetive, map them to near plane
-							for (int j = 0; j < 2; j++) {
-								if (p.distance_to(points[j]) < 0) {
-									points[j].z = -zn; //small hack to keep size constant when hitting the screen
-								}
-
-								p.intersects_segment(cam_xf.origin, points[j], &points[j]); //map to plane
-							}
-						}
-
-						float screen_diameter = points[0].distance_to(points[1]) * 2;
-						coverage = screen_diameter / (vp_half_extents.x + vp_half_extents.y);
+						coverage = coverage_of(ins->transform.origin, radius);
+					} break;
+					case RSE::LIGHT_LINE: {
+						// Each section is its own atlas client and earns its own
+						// resolution tier, so coverage is computed per section below.
 					} break;
 					default: {
 						ERR_PRINT("Invalid Light Type");
@@ -3622,12 +3707,46 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 				}
 			}
 
-			bool redraw = RSG::light_storage->shadow_atlas_update_light(p_shadow_atlas, light->instance, coverage, light->last_version);
+			// Line light viewpoints are separate atlas clients; other lights have one
+			// section, the instance itself.
+			const uint32_t sections = MIN(RSG::light_storage->light_instance_get_shadow_section_count(light->instance), RendererLightStorage::LINE_LIGHT_MAX_VIEWPOINTS);
+
+			bool redraw = false;
+			const bool is_line = RSG::light_storage->light_get_type(ins->base) == RSE::LIGHT_LINE;
+			float section_coverages[RendererLightStorage::LINE_LIGHT_MAX_VIEWPOINTS];
+			float max_coverage = 0.0f;
+			if (is_line) {
+				for (uint32_t s = 0; s < sections; s++) {
+					float offset;
+					float spacing;
+					RendererLightStorage::line_light_shadow_viewpoint(RSG::light_storage->light_line_get_length(ins->base), sections, s, offset, spacing);
+					const float radius = RSG::light_storage->light_get_param(ins->base, RSE::LIGHT_PARAM_RANGE) + spacing * 0.5f;
+					const Vector3 centre = ins->transform.origin + ins->transform.basis.get_column(0).normalized() * offset;
+					section_coverages[s] = coverage_of(centre, radius);
+					max_coverage = MAX(max_coverage, section_coverages[s]);
+				}
+			}
+			for (uint32_t s = 0; s < sections; s++) {
+				RID section = RSG::light_storage->light_instance_get_shadow_section(light->instance, s);
+				// Keep viewpoints within about one tier of the light's best.
+				const float section_coverage = is_line ? MAX(section_coverages[s], max_coverage * 0.5f) : coverage;
+				// Sections share one version counter, so redraw is all or nothing.
+				redraw = RSG::light_storage->shadow_atlas_update_light(p_shadow_atlas, section, section_coverage, light->last_version) || redraw;
+			}
 
 			if (redraw && max_shadows_used < MAX_UPDATE_SHADOWS) {
 				//must redraw!
 				RENDER_TIMESTAMP("> Render Light3D " + itos(i));
-				if (_light_instance_update_shadow(ins, p_camera_data->main_transform, p_camera_data->main_projection, p_camera_data->is_orthogonal, p_camera_data->vaspect, p_shadow_atlas, scenario, p_screen_mesh_lod_threshold, p_visible_layers)) {
+				bool dirty = false;
+				for (uint32_t s = 0; s < sections; s++) {
+					// A section without an atlas slot has nothing to render into.
+					RID section = RSG::light_storage->light_instance_get_shadow_section(light->instance, s);
+					if (!RSG::light_storage->light_instance_has_shadow_slot(p_shadow_atlas, section)) {
+						continue;
+					}
+					dirty = _light_instance_update_shadow(ins, p_camera_data->main_transform, p_camera_data->main_projection, p_camera_data->is_orthogonal, p_camera_data->vaspect, p_shadow_atlas, scenario, p_screen_mesh_lod_threshold, p_visible_layers, s) || dirty;
+				}
+				if (dirty) {
 					light->make_shadow_dirty();
 				}
 				RENDER_TIMESTAMP("< Render Light3D " + itos(i));

@@ -850,12 +850,14 @@ bool LineLight3D::is_line_normalizing_energy() const {
 }
 
 void LineLight3D::_validate_property(PropertyInfo &p_property) const {
-	// Line lights support neither shadows, baked GI nor light textures yet.
+	// Line lights support neither baked GI nor light textures yet.
 	// `light_size` is re-exposed as `line_radius`, which is what it means here.
-	if (p_property.name.begins_with("shadow_") || p_property.name == "light_bake_mode" ||
-			p_property.name == "light_indirect_energy" || p_property.name == "light_volumetric_fog_energy" ||
-			p_property.name == "distance_fade_shadow" || p_property.name == "light_projector" ||
-			p_property.name == "light_size") {
+	// Shadow softness comes from the segment itself, so there is no blur radius, and
+	// transmittance has no blocker depth yet.
+	if (p_property.name == "light_bake_mode" || p_property.name == "light_indirect_energy" ||
+			p_property.name == "light_volumetric_fog_energy" || p_property.name == "light_projector" ||
+			p_property.name == "light_size" || p_property.name == "shadow_transmittance_bias" ||
+			p_property.name == "shadow_blur") {
 		p_property.usage = PROPERTY_USAGE_NONE;
 	}
 }

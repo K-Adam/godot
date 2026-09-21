@@ -392,6 +392,12 @@ void LightStorage::light_line_set_length(RID p_light, float p_length) {
 	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
 }
 
+float LightStorage::light_line_get_length(RID p_light) const {
+	const Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL_V(light, 0.0f);
+	return light->line_length;
+}
+
 void LightStorage::light_line_set_normalize_energy(RID p_light, bool p_enabled) {
 	Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL(light);

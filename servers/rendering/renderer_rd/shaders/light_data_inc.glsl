@@ -13,7 +13,7 @@ struct LightData { //this structure needs to be as packed as possible
 	float attenuation;
 
 	mediump vec3 area_width;
-	float cone_attenuation; // area lights: 1 / (range + diagonal/2)
+	float cone_attenuation; // area lights: 1 / (range + diagonal/2); line lights: shadow depth scale, see line_light_shadow_extent()
 
 	mediump vec3 area_height;
 	float cone_angle; // area lights: max mipmaps

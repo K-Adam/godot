@@ -127,6 +127,13 @@ bool RenderingLightCuller::_prepare_light(const RendererSceneCull::Instance &p_i
 			float half_diagonal = lsource.area_size.length() / 2.0;
 			lsource.range = RSG::light_storage->light_get_param(p_instance.base, RSE::LIGHT_PARAM_RANGE) + half_diagonal;
 		} break;
+		case RSE::LIGHT_LINE: {
+			// Conservative range sphere; silhouette planes use the origin only, as for
+			// area lights.
+			float half_length = RSG::light_storage->light_line_get_length(p_instance.base) / 2.0;
+			lsource.type = LightSource::ST_OMNI;
+			lsource.range = RSG::light_storage->light_get_param(p_instance.base, RSE::LIGHT_PARAM_RANGE) + half_length;
+		} break;
 		default:
 			break;
 	}

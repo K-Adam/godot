@@ -53,6 +53,10 @@ LightStorage::LightStorage() {
 	directional_shadow.size = GLOBAL_GET("rendering/lights_and_shadows/directional_shadow/size");
 	directional_shadow.use_16_bits = GLOBAL_GET("rendering/lights_and_shadows/directional_shadow/16_bits");
 
+	const float section_length = GLOBAL_GET("rendering/lights_and_shadows/positional_shadow/line_light_section_length");
+	line_shadow_section_length = Math::is_finite(section_length) ? MAX(0.01f, section_length) : 1.5f;
+	line_shadow_max_sections = CLAMP((int)GLOBAL_GET("rendering/lights_and_shadows/positional_shadow/line_light_max_sections"), 1, 16);
+
 	using_lightmap_array = true; // high end
 	if (using_lightmap_array) {
 		uint64_t textures_per_stage = RD::get_singleton()->limit_get(RD::LIMIT_MAX_TEXTURES_PER_SHADER_STAGE);
@@ -273,9 +277,7 @@ void LightStorage::light_set_param(RID p_light, RSE::LightParam p_param, float p
 void LightStorage::light_set_shadow(RID p_light, bool p_enabled) {
 	Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL(light);
-	// Line lights have no shadow implementation yet. Refusing here keeps every
-	// shadow path (atlas allocation, culling, render passes) unreachable for them.
-	light->shadow = p_enabled && light->type != RSE::LIGHT_LINE;
+	light->shadow = p_enabled;
 
 	light->version++;
 	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
@@ -500,6 +502,12 @@ void LightStorage::light_line_set_length(RID p_light, float p_length) {
 	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
 }
 
+float LightStorage::light_line_get_length(RID p_light) const {
+	const Light *light = light_owner.get_or_null(p_light);
+	ERR_FAIL_NULL_V(light, 0.0f);
+	return light->line_length;
+}
+
 void LightStorage::light_line_set_normalize_energy(RID p_light, bool p_enabled) {
 	Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL(light);
@@ -629,8 +637,70 @@ RID LightStorage::light_instance_create(RID p_light) {
 	return li;
 }
 
+uint32_t LightStorage::_line_light_shadow_sections(const Light *p_light) const {
+	if (p_light->type != RSE::LIGHT_LINE || !p_light->shadow || p_light->line_length <= 0.0) {
+		return 1;
+	}
+	// Viewpoints sit at both ends and every section boundary; a very short light gets
+	// one at its middle.
+	if (p_light->line_length < 0.1f * line_shadow_section_length) {
+		return 1;
+	}
+	// Clamped before the cast: the count feeds `wanted - 1` on an unsigned below.
+	const float sections = Math::ceil(p_light->line_length / line_shadow_section_length);
+	return (uint32_t)CLAMP(sections, 1.0f, (float)line_shadow_max_sections) + 1;
+}
+
+void LightStorage::light_instance_update_shadow_sections(RID p_light_instance) {
+	LightInstance *light_instance = light_instance_owner.get_or_null(p_light_instance);
+	ERR_FAIL_NULL(light_instance);
+	const Light *light = light_owner.get_or_null(light_instance->light);
+	ERR_FAIL_NULL(light);
+
+	// Section 0 is the parent itself, so only the extra ones are owned here.
+	const uint32_t wanted = _line_light_shadow_sections(light) - 1;
+
+	while (light_instance->shadow_sections.size() > wanted) {
+		RID last = light_instance->shadow_sections[light_instance->shadow_sections.size() - 1];
+		light_instance->shadow_sections.resize(light_instance->shadow_sections.size() - 1);
+		light_instance_free(last);
+	}
+	while (light_instance->shadow_sections.size() < wanted) {
+		RID section = light_instance_owner.make_rid(LightInstance());
+		LightInstance *section_instance = light_instance_owner.get_or_null(section);
+		section_instance->self = section;
+		section_instance->light = light_instance->light;
+		section_instance->light_type = light_instance->light_type;
+		section_instance->transform = light_instance->transform;
+		section_instance->is_shadow_section = true;
+		light_instance->shadow_sections.push_back(section);
+	}
+}
+
+uint32_t LightStorage::light_instance_get_shadow_section_count(RID p_light_instance) const {
+	const LightInstance *light_instance = light_instance_owner.get_or_null(p_light_instance);
+	ERR_FAIL_NULL_V(light_instance, 1);
+	return light_instance->shadow_sections.size() + 1;
+}
+
+RID LightStorage::light_instance_get_shadow_section(RID p_light_instance, uint32_t p_section) const {
+	const LightInstance *light_instance = light_instance_owner.get_or_null(p_light_instance);
+	ERR_FAIL_NULL_V(light_instance, RID());
+	if (p_section == 0) {
+		return p_light_instance;
+	}
+	ERR_FAIL_UNSIGNED_INDEX_V(p_section - 1, light_instance->shadow_sections.size(), RID());
+	return light_instance->shadow_sections[p_section - 1];
+}
+
 void LightStorage::light_instance_free(RID p_light) {
 	LightInstance *light_instance = light_instance_owner.get_or_null(p_light);
+	ERR_FAIL_NULL(light_instance);
+
+	for (const RID &section : light_instance->shadow_sections) {
+		light_instance_free(section);
+	}
+	light_instance->shadow_sections.clear();
 
 	//remove from shadow atlases..
 	for (const RID &E : light_instance->shadow_atlases) {
@@ -650,7 +720,8 @@ void LightStorage::light_instance_free(RID p_light) {
 		shadow_atlas->shadow_owners.erase(p_light);
 	}
 
-	if (light_instance->light_type != RSE::LIGHT_DIRECTIONAL) {
+	// Sections are not lights, so they never took a forward ID.
+	if (light_instance->light_type != RSE::LIGHT_DIRECTIONAL && !light_instance->is_shadow_section) {
 		ForwardIDType forward_id_type = _light_type_to_forward_id_type(light_instance->light_type);
 		ForwardIDStorage::get_singleton()->free_forward_id(forward_id_type, light_instance->forward_id);
 	}
@@ -662,6 +733,13 @@ void LightStorage::light_instance_set_transform(RID p_light_instance, const Tran
 	ERR_FAIL_NULL(light_instance);
 
 	light_instance->transform = p_transform;
+	// Sections are light instances too; nothing may read a stale transform off one.
+	for (const RID &section : light_instance->shadow_sections) {
+		LightInstance *section_instance = light_instance_owner.get_or_null(section);
+		if (section_instance) {
+			section_instance->transform = p_transform;
+		}
+	}
 }
 
 void LightStorage::light_instance_set_aabb(RID p_light_instance, const AABB &p_aabb) {
@@ -669,6 +747,12 @@ void LightStorage::light_instance_set_aabb(RID p_light_instance, const AABB &p_a
 	ERR_FAIL_NULL(light_instance);
 
 	light_instance->aabb = p_aabb;
+	for (const RID &section : light_instance->shadow_sections) {
+		LightInstance *section_instance = light_instance_owner.get_or_null(section);
+		if (section_instance) {
+			section_instance->aabb = p_aabb;
+		}
+	}
 }
 
 void LightStorage::light_instance_set_shadow_transform(RID p_light_instance, const Projection &p_projection, const Transform3D &p_transform, float p_far, float p_split, int p_pass, float p_shadow_texel_size, float p_bias_scale, float p_range_begin, const Vector2 &p_uv_scale) {
@@ -691,7 +775,15 @@ void LightStorage::light_instance_mark_visible(RID p_light_instance) {
 	LightInstance *light_instance = light_instance_owner.get_or_null(p_light_instance);
 	ERR_FAIL_NULL(light_instance);
 
-	light_instance->last_scene_pass = RendererSceneRenderRD::get_singleton()->get_scene_pass();
+	const uint64_t scene_pass = RendererSceneRenderRD::get_singleton()->get_scene_pass();
+	light_instance->last_scene_pass = scene_pass;
+	// Sections hold their own atlas slots; keep them alive with the light.
+	for (const RID &section : light_instance->shadow_sections) {
+		LightInstance *section_instance = light_instance_owner.get_or_null(section);
+		if (section_instance) {
+			section_instance->last_scene_pass = scene_pass;
+		}
+	}
 }
 
 /* LIGHT DATA */
@@ -1008,6 +1100,10 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 
 	bool using_forward_ids = forward_id_storage->uses_forward_ids();
 
+	// Shadow viewpoints of long line lights, appended past the real ones in the
+	// same array and uploaded with them.
+	uint32_t line_section_records = 0;
+
 	for (const LightBucket &bucket : buckets) {
 		const RSE::LightType type = bucket.type;
 
@@ -1134,9 +1230,12 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 				light_data.area_height[0] = 0.0;
 				light_data.area_height[1] = 0.0;
 				light_data.area_height[2] = 0.0;
-				// Spot-only fields; keep sane values out of the shared buffer.
-				light_data.inv_spot_attenuation = 0.0;
+				// Shadow depth scale; see line_light_shadow_extent().
+				light_data.inv_spot_attenuation = 1.0 / (radius + line_light_shadow_extent(length, light_instance_get_shadow_section_count(light_instance->self)));
 				light_data.cos_spot_angle = 0.0;
+				// Overwritten below if this light ends up with a shadow.
+				light_data.pad[0] = float(index);
+				light_data.pad[1] = 1.0;
 
 				if (light->area_normalize_energy && length > 0.0) {
 					// Keep total output independent of length, so that a short broadside
@@ -1256,6 +1355,57 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 						light_data.soft_shadow_size = 0.0;
 						light_data.soft_shadow_scale *= RendererSceneRenderRD::get_singleton()->shadows_quality_radius_get(); // Only use quality radius for PCF
 					}
+				} else if (type == RSE::LIGHT_LINE) {
+					// Segment on shadow-local +Z; sections share this matrix, shifted along Z.
+					Transform3D proj = (inverse_transform * line_light_shadow_transform(light_transform.orthonormalized())).inverse();
+
+					RendererRD::MaterialStorage::store_transform(proj, light_data.shadow_matrix);
+
+					// `size` is a regularization radius, not a softness.
+					light_data.soft_shadow_size = 0.0;
+
+					light_data.direction[0] = omni_offset.x * float(rect.size.width);
+					light_data.direction[1] = omni_offset.y * float(rect.size.height);
+
+					// First per-viewpoint record and viewpoint count.
+					const uint32_t sections = light_instance_get_shadow_section_count(light_instance->self);
+					light_data.pad[0] = float(index);
+					light_data.pad[1] = 1.0;
+					if (shadow_atlas_get_line_pyramid(p_shadow_atlas).is_null()) {
+						light_data.shadow_opacity = 0.0; // Not rendered yet; the shader needs the pyramid.
+					}
+
+					// Extra sections live past the real lights in the same array.
+					if (sections > 1) {
+						if (bucket.count + line_section_records + sections <= (uint32_t)max_lights) {
+							const uint32_t base = bucket.count + line_section_records;
+							for (uint32_t s = 0; s < sections; s++) {
+								RID section = light_instance_get_shadow_section(light_instance->self, s);
+
+								// A slotless section gets an empty rect; neighbours take its cells.
+								Rect2 section_rect;
+								Vector2i section_offset;
+								if (shadow_atlas_owns_light_instance(p_shadow_atlas, section)) {
+									section_rect = light_instance_get_shadow_atlas_rect(section, p_shadow_atlas, section_offset);
+								}
+
+								// Only these two fields of a record are ever read back.
+								LightData &record = bucket.data[base + s];
+								record.atlas_rect[0] = section_rect.position.x;
+								record.atlas_rect[1] = section_rect.position.y;
+								record.atlas_rect[2] = section_rect.size.width;
+								record.atlas_rect[3] = section_rect.size.height;
+								record.direction[0] = section_offset.x * float(section_rect.size.width);
+								record.direction[1] = section_offset.y * float(section_rect.size.height);
+							}
+							light_data.pad[0] = float(base);
+							light_data.pad[1] = float(sections);
+							line_section_records += sections;
+						} else {
+							// No room for this light's viewpoints: drop its shadow.
+							light_data.shadow_opacity = 0.0;
+						}
+					}
 				} else if (type == RSE::LIGHT_SPOT) {
 					Transform3D modelview = (inverse_transform * light_transform).inverse();
 					Projection bias;
@@ -1295,8 +1445,10 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 
 	//update without barriers
 	for (const LightBucket &bucket : buckets) {
-		if (bucket.count) {
-			RD::get_singleton()->buffer_update(bucket.buffer, 0, sizeof(LightData) * bucket.count, bucket.data);
+		// Line lights carry their extra shadow viewpoints in the tail of the array.
+		const uint32_t upload_count = bucket.count + (bucket.type == RSE::LIGHT_LINE ? line_section_records : 0);
+		if (upload_count) {
+			RD::get_singleton()->buffer_update(bucket.buffer, 0, sizeof(LightData) * upload_count, bucket.data);
 		}
 	}
 
@@ -2420,6 +2572,34 @@ void LightStorage::_update_shadow_atlas(ShadowAtlas *shadow_atlas) {
 	}
 }
 
+const RID *LightStorage::shadow_atlas_get_line_pyramid_levels(RID p_atlas, int &r_count) {
+	r_count = 0;
+	ShadowAtlas *atlas = shadow_atlas_owner.get_or_null(p_atlas);
+	ERR_FAIL_NULL_V(atlas, nullptr);
+	if (atlas->size < 4) {
+		return nullptr;
+	}
+	if (atlas->line_pyramid.is_null()) {
+		// Level 0 covers 4x4 atlas texels, and each level after it twice that.
+		atlas->line_pyramid_level_count = MIN(LINE_SHADOW_PYRAMID_LEVELS, (int)Math::floor_log2((uint32_t)atlas->size / 4) + 1);
+		RD::TextureFormat tf;
+		tf.format = RD::DATA_FORMAT_R32_SFLOAT;
+		tf.width = atlas->size / 4;
+		tf.height = atlas->size / 4;
+		tf.mipmaps = atlas->line_pyramid_level_count;
+		tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+		atlas->line_pyramid = RD::get_singleton()->texture_create(tf, RD::TextureView());
+		RD::get_singleton()->set_resource_name(atlas->line_pyramid, "Line light shadow pyramid");
+		// Zero is "nothing recorded", which culls everything.
+		RD::get_singleton()->texture_clear(atlas->line_pyramid, Color(0, 0, 0, 0), 0, atlas->line_pyramid_level_count, 0, 1);
+		for (int i = 0; i < atlas->line_pyramid_level_count; i++) {
+			atlas->line_pyramid_levels[i] = RD::get_singleton()->texture_create_shared_from_slice(RD::TextureView(), atlas->line_pyramid, 0, i);
+		}
+	}
+	r_count = atlas->line_pyramid_level_count;
+	return atlas->line_pyramid_levels;
+}
+
 void LightStorage::shadow_atlas_set_size(RID p_atlas, int p_size, bool p_16_bits) {
 	ShadowAtlas *shadow_atlas = shadow_atlas_owner.get_or_null(p_atlas);
 	ERR_FAIL_NULL(shadow_atlas);
@@ -2434,6 +2614,14 @@ void LightStorage::shadow_atlas_set_size(RID p_atlas, int p_size, bool p_16_bits
 	if (shadow_atlas->depth.is_valid()) {
 		RD::get_singleton()->free_rid(shadow_atlas->depth);
 		shadow_atlas->depth = RID();
+	}
+	if (shadow_atlas->line_pyramid.is_valid()) {
+		for (int i = 0; i < shadow_atlas->line_pyramid_level_count; i++) {
+			RD::get_singleton()->free_rid(shadow_atlas->line_pyramid_levels[i]);
+			shadow_atlas->line_pyramid_levels[i] = RID();
+		}
+		RD::get_singleton()->free_rid(shadow_atlas->line_pyramid);
+		shadow_atlas->line_pyramid = RID();
 	}
 	for (int i = 0; i < 4; i++) {
 		//clear subdivisions
@@ -2714,7 +2902,9 @@ bool LightStorage::shadow_atlas_update_light(RID p_atlas, RID p_light_instance, 
 		old_subdivision = shadow_atlas->quadrants[old_quadrant].subdivision;
 	}
 
-	bool is_omni = li->light_type == RSE::LIGHT_OMNI;
+	// Omni and line lights take two adjacent slots (paraboloid or polar halves); this
+	// drives the paired allocation and the key's `OMNI_LIGHT_FLAG`.
+	bool is_omni = li->light_type == RSE::LIGHT_OMNI || li->light_type == RSE::LIGHT_LINE;
 	bool found_shadow = false;
 	int new_quadrant = -1;
 	int new_shadow = -1;

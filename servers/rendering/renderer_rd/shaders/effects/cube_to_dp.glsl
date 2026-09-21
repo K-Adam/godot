@@ -38,6 +38,13 @@ params;
 
 void main() {
 	vec2 uv = uv_interp;
+#ifdef MODE_POLAR
+	// Line light layout: columns are the angle from +Z, rows the azimuth around it, and
+	// the flipped half holds the second half turn. A row is then one plane through Z.
+	float theta = uv.x * 3.14159265359;
+	float phi = (uv.y + (params.texel_size.x < 0.0 ? 1.0 : 0.0)) * 3.14159265359;
+	vec3 normal = vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+#else
 	vec2 texel_size = abs(params.texel_size);
 
 	uv = clamp(uv * (1.0 + 2.0 * texel_size) - texel_size, vec2(0.0), vec2(1.0));
@@ -45,11 +52,12 @@ void main() {
 	vec3 normal = vec3(uv * 2.0 - 1.0, 0.0);
 	normal.z = 0.5 * (1.0 - dot(normal.xy, normal.xy)); // z = 1/2 - 1/2 * (x^2 + y^2)
 	normal = normalize(normal);
-
-	normal.y = -normal.y; //needs to be flipped to match projection matrix
 	if (params.texel_size.x >= 0.0) { // Sign is used to encode Z flip
 		normal.z = -normal.z;
 	}
+#endif
+
+	normal.y = -normal.y; //needs to be flipped to match projection matrix
 
 	float depth = texture(source_cube, normal).r;
 

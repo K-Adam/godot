@@ -361,6 +361,7 @@ public:
 	virtual RID light_area_get_texture(RID p_light) const override;
 
 	virtual void light_line_set_length(RID p_light, float p_length) override;
+	virtual float light_line_get_length(RID p_light) const override;
 	virtual void light_line_set_normalize_energy(RID p_light, bool p_enabled) override;
 
 	virtual RSE::LightDirectionalShadowMode light_directional_get_shadow_mode(RID p_light) override;
