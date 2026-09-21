@@ -1326,7 +1326,6 @@ void light_process_area(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 // and the line as one row. Surfaces found there inside the receiver-segment triangle
 // are projected from the receiver onto the segment and OR-ed into a mask of cells.
 
-#define LINE_SHADOW_CELLS 32u
 // Texels of depth error still counted as the receiver's own surface.
 #define LINE_SHADOW_PLANE_TEXELS 1.5
 // Neighbouring depths within this many texels are joined into one surface.
@@ -1339,6 +1338,7 @@ struct LineShadowContext {
 	vec2 texel_size; // One atlas texel in atlas UV.
 	float jitter;
 	float row_jitter;
+	float stride_jitter;
 	uint section_base; // First per-viewpoint record in the line light array.
 	uint sections; // How many viewpoints.
 	float seg_length;
@@ -1359,59 +1359,17 @@ LineShadowContext line_shadow_begin(uint idx, vec3 vertex, vec3 normal, float ta
 	ctx.receiver += ctx.normal * (line_lights.data[idx].shadow_normal_bias * dist);
 	ctx.jitter = quick_hash(gl_FragCoord.xy + vec2(taa_frame_count * 5.588238));
 	ctx.row_jitter = quick_hash(gl_FragCoord.yx + vec2(17.0 + taa_frame_count * 3.371));
+	// R2 sequence: a lattice unrelated to the two above.
+	ctx.stride_jitter = fract(dot(gl_FragCoord.xy, vec2(0.7548777, 0.5698403)) + taa_frame_count * 0.618034);
 	return ctx;
 }
 
-// Cells are equal shares of the density w / (w^2 + x^2)^(3/2), x = u - center, i.e.
-// uniform in f(x) = x / sqrt(w^2 + x^2), each sampled at a jittered spot.
-struct LineShadowCells {
-	float center;
-	float width;
-	float f_lo;
-	float scale; // Cells per unit of f.
-	float jitter;
-};
-
-LineShadowCells line_shadow_cells(float center, float width, float half_length, float jitter) {
-	LineShadowCells c;
-	c.center = center;
-	c.width = width;
-	c.jitter = jitter;
-	float a = -half_length - center;
-	float b = half_length - center;
-	c.f_lo = a * inversesqrt(width * width + a * a);
-	c.scale = float(LINE_SHADOW_CELLS) / max(b * inversesqrt(width * width + b * b) - c.f_lo, 1e-7);
-	return c;
-}
-
-float line_shadow_cell_u(LineShadowCells c, uint i) {
-	float a = c.f_lo + (float(i) + c.jitter) / c.scale;
-	// (1 - a) * (1 + a) avoids cancellation near the ends.
-	return c.center + c.width * a * inversesqrt(max((1.0 - a) * (1.0 + a), 1e-12));
-}
-
-// Fractional cell index of the point u, such that cell i is sampled at exactly i.
-float line_shadow_cell_of(LineShadowCells c, float u) {
-	float x = clamp(u - c.center, -1e4, 1e4);
-	return (x * inversesqrt(c.width * c.width + x * x) - c.f_lo) * c.scale - c.jitter;
-}
-
-// The cells sampled within [u0, u1].
-uint line_shadow_cell_bits(LineShadowCells c, float u0, float u1) {
-	int a = int(ceil(clamp(line_shadow_cell_of(c, u0), -1.0, 32.0)));
-	int b = int(floor(clamp(line_shadow_cell_of(c, u1), -1.0, 32.0)));
-	a = max(a, 0);
-	b = min(b, 31);
-	if (b < a) {
-		return 0u;
-	}
-	return (0xFFFFFFFFu >> uint(31 - b)) & (0xFFFFFFFFu << uint(a));
-}
+#include "line_light_cells_inc.glsl"
 
 // Marks the cells the surface piece from `a` to `b` hides. Slice coordinates relative to
 // the viewpoint: x from the line, y along it. `ha`, `hb` are heights above the
 // receiver's plane; `rv` is the receiver's slice position and the viewpoint offset.
-void _line_shadow_segment(vec2 a, vec2 b, float ha, float hb, vec3 rv, LineShadowCells cd, LineShadowCells cs, inout highp uint md, inout highp uint ms) {
+void _line_shadow_segment(vec2 a, vec2 b, float ha, float hb, vec3 rv, LineShadowCells cd, LineShadowCells cs, inout uvec2 md, inout uvec2 ms) {
 	// Anything below the receiver's plane only hides directions below its horizon.
 	if (max(ha, hb) <= 0.0) {
 		return;
@@ -1456,7 +1414,7 @@ float _line_shadow_exit(vec2 r, float a, float b, float theta_r, float theta) {
 }
 
 // Adds to `md`/`ms` the cells of `own_d`/`own_s` hidden in viewpoint `view`'s map.
-void _line_shadow_walk(LineShadowContext ctx, uint view, float v, LineShadowCells cd, LineShadowCells cs, highp uint own_d, highp uint own_s, inout highp uint md, inout highp uint ms) {
+void _line_shadow_walk(LineShadowContext ctx, uint view, float v, LineShadowCells cd, LineShadowCells cs, uvec2 own_d, uvec2 own_s, inout uvec2 md, inout uvec2 ms) {
 	uint record = ctx.section_base + view;
 	vec4 rect = line_lights.data[record].atlas_rect;
 	ivec2 origin = ivec2(round(rect.xy / ctx.texel_size));
@@ -1490,13 +1448,13 @@ void _line_shadow_walk(LineShadowContext ctx, uint view, float v, LineShadowCell
 	// nearest depth lies beyond it are skipped.
 	float ua = 1e9;
 	float ub = -1e9;
-	if (own_d != 0u) {
-		ua = line_shadow_cell_u(cd, uint(findLSB(own_d)));
-		ub = line_shadow_cell_u(cd, uint(findMSB(own_d)));
+	if (own_d != uvec2(0u)) {
+		ua = line_shadow_cell_u(cd, float(line_mask_lsb(own_d)));
+		ub = line_shadow_cell_u(cd, float(line_mask_msb(own_d)));
 	}
-	if (own_s != 0u) {
-		ua = min(ua, line_shadow_cell_u(cs, uint(findLSB(own_s))));
-		ub = max(ub, line_shadow_cell_u(cs, uint(findMSB(own_s))));
+	if (own_s != uvec2(0u)) {
+		ua = min(ua, line_shadow_cell_u(cs, float(line_mask_lsb(own_s))));
+		ub = max(ub, line_shadow_cell_u(cs, float(line_mask_msb(own_s))));
 	}
 	float tri_a = min(ua - v, 0.0);
 	float tri_b = max(ub - v, 0.0);
@@ -1507,8 +1465,8 @@ void _line_shadow_walk(LineShadowContext ctx, uint view, float v, LineShadowCell
 	int top = size >= 16 ? min(findMSB(size) - 2, 8) & ~1 : -2;
 
 	// Each step tests a block or reads a texel, which keeps divergence low.
-	highp uint hd = 0u;
-	highp uint hs = 0u;
+	uvec2 hd = uvec2(0u);
+	uvec2 hs = uvec2(0u);
 	bool prev_ok = false;
 	vec2 prev_x = vec2(0.0);
 	float prev_h = 0.0;
@@ -1602,9 +1560,9 @@ int _line_shadow_next_view(LineShadowContext ctx, int k, uint stride) {
 }
 
 // The cells of `cd` (and of `cs`, if `do_specular`) hidden from the receiver.
-void line_shadow_mask(LineShadowContext ctx, LineShadowCells cd, LineShadowCells cs, bool do_specular, out highp uint md, out highp uint ms) {
-	md = 0u;
-	ms = 0u;
+void line_shadow_mask(LineShadowContext ctx, LineShadowCells cd, LineShadowCells cs, bool do_specular, out uvec2 md, out uvec2 ms) {
+	md = uvec2(0u);
+	ms = uvec2(0u);
 	float half_len = 0.5 * ctx.seg_length;
 	float spacing = ctx.sections > 1u ? ctx.seg_length / float(ctx.sections - 1u) : 0.0;
 
@@ -1615,13 +1573,12 @@ void line_shadow_mask(LineShadowContext ctx, LineShadowCells cd, LineShadowCells
 	uint first = 0u;
 	if (ctx.sections > 2u) {
 		float reach = length(ctx.receiver.xy) / 3.0;
-		float dither = fract(ctx.jitter * 7.31);
 		uint middle = (ctx.sections - 1u) / 2u;
 		float middle_reach = 0.5 * ctx.seg_length + abs(float(middle) * spacing - 0.5 * ctx.seg_length);
-		if (log2(max(reach / middle_reach, 1e-6)) >= dither && line_lights.data[ctx.section_base + middle].atlas_rect.z > 0.0) {
+		if (log2(max(reach / middle_reach, 1e-6)) >= ctx.stride_jitter && line_lights.data[ctx.section_base + middle].atlas_rect.z > 0.0) {
 			first = middle;
 		} else {
-			float n = floor(log2(max(reach / spacing, 1.0)) - dither);
+			float n = floor(log2(max(reach / spacing, 1.0)) - ctx.stride_jitter);
 			stride = min(1u << uint(clamp(n, 0.0, 5.0)), ctx.sections - 1u);
 		}
 	}
@@ -1635,9 +1592,9 @@ void line_shadow_mask(LineShadowContext ctx, LineShadowCells cd, LineShadowCells
 		float v = ctx.sections > 1u ? -half_len + float(k) * spacing : 0.0;
 		float lo = prev >= 0 ? -half_len + float(prev) * spacing : -ctx.seg_length;
 		float hi = next >= 0 ? -half_len + float(next) * spacing : ctx.seg_length;
-		highp uint own_d = line_shadow_cell_bits(cd, lo, hi) & ~md;
-		highp uint own_s = do_specular ? line_shadow_cell_bits(cs, lo, hi) & ~ms : 0u;
-		if ((own_d | own_s) != 0u) {
+		uvec2 own_d = line_shadow_cell_bits(cd, lo, hi) & ~md;
+		uvec2 own_s = do_specular ? line_shadow_cell_bits(cs, lo, hi) & ~ms : uvec2(0u);
+		if ((own_d | own_s) != uvec2(0u)) {
 			_line_shadow_walk(ctx, uint(k), v, cd, cs, own_d, own_s, md, ms);
 		}
 		prev = k;
@@ -1678,9 +1635,36 @@ void line_shadow_visibility(uint idx, LineShadowContext ctx, vec3 normal, vec3 e
 	// Cells are placed in the light's frame, u = l - l_center.
 	LineShadowCells cd = line_shadow_cells(-l_center, d, half_len, ctx.jitter);
 	LineShadowCells cs = line_shadow_cells(lm - l_center, w, half_len, fract(ctx.jitter + 0.5));
-	highp uint md;
-	highp uint ms;
+	uvec2 md;
+	uvec2 ms;
 	line_shadow_mask(ctx, cd, cs, do_specular, md, ms);
+#ifdef USE_LINE_CONTACT_SHADOWS
+	uint contact = uint(line_lights.data[idx].cone_angle);
+	if (contact > 0u && bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_LINE_SSCS)) {
+#ifdef USE_MULTIVIEW
+		uint layer = (contact - 1u) * 2u + ViewIndex;
+#else
+		uint layer = contact - 1u;
+#endif
+		uint hits = uint(texelFetch(sampler2DArray(line_contact_shadows, SAMPLER_NEAREST_CLAMP), ivec3(gl_FragCoord.xy, layer), 0).r * 65535.0 + 0.5);
+		// Hidden fraction of each quarter of the diffuse cells, and specular cells over its span.
+		LineShadowCells quarters = cd;
+		quarters.jitter = 0.0;
+		const int span = int(LINE_SHADOW_CELLS) / 4;
+		for (int k = 0; k < 4; k++) {
+			int n = min(int(float((hits >> uint(4 * k)) & 15u) * (float(span) / 15.0) + ctx.jitter), span);
+			if (n > 0) {
+				md |= line_mask_range(k * span, k * span + n - 1);
+				ms |= line_shadow_cell_bits(cs, line_shadow_cell_u(quarters, float(k * span)), line_shadow_cell_u(quarters, float(k * span + n)));
+			}
+		}
+	}
+#endif
+	if ((md | ms) == uvec2(0u)) {
+		r_vis_diffuse = half(1.0);
+		r_vis_specular = half(1.0);
+		return;
+	}
 
 	// Accumulated as loss so a fully lit receiver gives exactly 1.0.
 	float wd_sum = 0.0;
@@ -1688,16 +1672,16 @@ void line_shadow_visibility(uint idx, LineShadowContext ctx, vec3 normal, vec3 e
 	float ws_sum = 0.0;
 	float s_loss = 0.0;
 	[[dont_unroll]] for (uint i = 0u; i < LINE_SHADOW_CELLS; i++) {
-		float li = line_shadow_cell_u(cd, i) + l_center;
+		float li = line_shadow_cell_u(cd, float(i)) + l_center;
 		float wd = max(dot(normal, (po_w + wt * li) * inversesqrt(d * d + li * li)), 0.0);
 		wd_sum += wd;
-		d_loss += ((md >> i) & 1u) != 0u ? wd : 0.0;
+		d_loss += line_mask_test(md, i) ? wd : 0.0;
 		if (do_specular) {
-			float dl = line_shadow_cell_u(cs, i) + l_center - lm;
+			float dl = line_shadow_cell_u(cs, float(i)) + l_center - lm;
 			float r2 = w * w + dl * dl;
 			float ws = _line_shadow_specular_integrand(cos_xform, po_w + wt * (lm + dl), ct_n, r_min_cos_sq) / max(w * inversesqrt(r2) / r2, 1e-20);
 			ws_sum += ws;
-			s_loss += ((ms >> i) & 1u) != 0u ? ws : 0.0;
+			s_loss += line_mask_test(ms, i) ? ws : 0.0;
 		}
 	}
 
@@ -1781,11 +1765,11 @@ void light_process_line(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, hvec
 	float ref_opacity = line_lights.data[idx].shadow_opacity;
 	bool ref_shadowed = ref_opacity > 0.001;
 	LineShadowCells ref_cells;
-	highp uint ref_mask = 0u;
+	uvec2 ref_mask = uvec2(0u);
 	if (ref_shadowed) {
 		LineShadowContext ref_ctx = line_shadow_begin(idx, vertex, vec3(normal), taa_frame_count);
 		ref_cells = line_shadow_cells(ref_ctx.receiver.z, max(length(ref_ctx.receiver.xy), LINE_LIGHT_MIN_DISTANCE), half_len, ref_ctx.jitter);
-		highp uint unused;
+		uvec2 unused;
 		line_shadow_mask(ref_ctx, ref_cells, ref_cells, false, ref_mask, unused);
 	}
 #endif
@@ -1801,8 +1785,8 @@ void light_process_line(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, hvec
 			half sample_weight = half(quad_weights[node_i] * half_len * sin_phi / dist_sq);
 #ifndef SHADOWS_DISABLED
 			if (ref_shadowed) {
-				uint cell = uint(clamp(floor(line_shadow_cell_of(ref_cells, node * half_len) + ref_cells.jitter), 0.0, 31.0));
-				if (((ref_mask >> cell) & 1u) != 0u) {
+				uint cell = uint(clamp(floor(line_shadow_cell_of(ref_cells, node * half_len) + ref_cells.jitter), 0.0, float(LINE_SHADOW_CELLS - 1u)));
+				if (line_mask_test(ref_mask, cell)) {
 					sample_weight *= half(1.0 - ref_opacity);
 				}
 			}

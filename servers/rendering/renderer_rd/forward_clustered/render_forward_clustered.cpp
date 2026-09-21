@@ -124,6 +124,7 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 		render_buffers->clear_context(RB_SCOPE_SSAO);
 		render_buffers->clear_context(RB_SCOPE_SSR);
 		render_buffers->clear_context(RB_SCOPE_SSCS);
+		render_buffers->clear_context(RB_SCOPE_SSCS_LINE);
 	}
 
 	if (cluster_builder) {
@@ -771,6 +772,7 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 			ss_flags |= environment_get_ssil_enabled(p_render_data->environment) ? SCREEN_SPACE_EFFECTS_FLAGS_USE_SSIL : 0;
 			ss_flags |= environment_get_ssr_enabled(p_render_data->environment) ? SCREEN_SPACE_EFFECTS_FLAGS_USE_SSR : 0;
 			ss_flags |= bool(GLOBAL_GET_CACHED(bool, "rendering/lights_and_shadows/contact_shadow/enabled")) ? SCREEN_SPACE_EFFECTS_FLAGS_USE_SSCS : 0;
+			ss_flags |= line_sscs_used ? SCREEN_SPACE_EFFECTS_FLAGS_USE_LINE_SSCS : 0;
 
 			if (rd.is_valid()) {
 				Ref<RenderBufferDataForwardClustered> rb_data;
@@ -1749,6 +1751,24 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 	light_storage->update_light_buffers(p_render_data, *p_render_data->lights, p_render_data->scene_data->cam_transform, p_render_data->shadow_atlas, using_shadows, directional_light_count, positional_light_count, p_render_data->directional_light_soft_shadows);
 	texture_storage->update_decal_buffer(*p_render_data->decals, p_render_data->scene_data->cam_transform);
 
+	// After update_light_buffers(), which picks the lights and fills their buffer.
+	uint32_t line_contact_count = 0;
+	const uint32_t *line_contact_lights = light_storage->get_line_contact_shadows(line_contact_count);
+	line_sscs_used = line_sscs_used && rb_data.is_valid() && ss_effects && line_contact_count > 0 && p_normal_roughness_slices[0].is_valid();
+	if (line_sscs_used) {
+		RENDER_TIMESTAMP("Process Line Light SSCS");
+		RendererRD::SSEffects::SSCSSettings settings;
+		settings.quality = RSE::ScreenSpaceContactShadowsLength(GLOBAL_GET_CACHED(int, "rendering/lights_and_shadows/contact_shadow/shadow_length"));
+		settings.surface_thickness = GLOBAL_GET_CACHED(float, "rendering/lights_and_shadows/contact_shadow/surface_thickness");
+		Projection projections[RendererSceneRender::MAX_RENDER_VIEWS];
+		for (uint32_t v = 0; v < p_render_data->scene_data->view_count; v++) {
+			projections[v] = p_render_data->scene_data->get_view_projection(v);
+		}
+		ss_effects->line_light_contact_shadows(rb, settings, projections, p_normal_roughness_slices, light_storage->get_line_light_buffer(), line_contact_lights, line_contact_count, light_storage->shadow_atlas_get_size(p_render_data->shadow_atlas), p_render_data->scene_data->taa_frame_count);
+	} else if (rb_data.is_valid() && rb->has_texture(RB_SCOPE_SSCS_LINE, RB_SSCS)) {
+		rb->clear_context(RB_SCOPE_SSCS_LINE);
+	}
+
 	p_render_data->directional_light_count = directional_light_count;
 
 	if (current_cluster_builder) {
@@ -2267,6 +2287,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 			normal_roughness_views[v] = rb_data->get_normal_roughness(v);
 		}
 	}
+	// Line light contact shadows march the finished depth prepass.
+	line_sscs_used = using_sscs && depth_pre_pass && is_environment(p_render_data->environment) && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED;
 	_pre_opaque_render(p_render_data, using_ssao, using_ssil, using_ssr, using_sscs, using_sdfgi || using_voxelgi, normal_roughness_views, rb_data.is_valid() && rb_data->has_voxelgi() ? rb_data->get_voxelgi() : RID());
 
 	if (current_cluster_builder) {
@@ -3931,6 +3953,17 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 
 		RID texture = sscs.is_valid() ? sscs : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK);
 		u.append_id(texture);
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 40;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID texture;
+		if (rb_data.is_valid() && rb->has_texture(RB_SCOPE_SSCS_LINE, RB_SSCS)) {
+			texture = rb->get_texture(RB_SCOPE_SSCS_LINE, RB_SSCS);
+		}
+		u.append_id(texture.is_valid() ? texture : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK));
 		uniforms.push_back(u);
 	}
 #ifdef MODULE_TEXTURE_STREAMING_ENABLED

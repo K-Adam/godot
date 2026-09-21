@@ -163,7 +163,7 @@ private:
 		float inv_spot_attenuation; // area lights: 1 / (range + diagonal/2)
 
 		float area_height[3];
-		float cos_spot_angle; // area lights: max mipmaps
+		float cos_spot_angle; // area lights: max mipmaps; line lights: contact shadow layer + 1, or 0
 
 		float specular_amount;
 		float shadow_opacity;
@@ -196,6 +196,9 @@ private:
 	uint32_t spot_light_count = 0;
 	uint32_t area_light_count = 0;
 	uint32_t line_light_count = 0;
+	static constexpr uint32_t LINE_CONTACT_SHADOWS_MAX = 8;
+	uint32_t line_contact_shadows[LINE_CONTACT_SHADOWS_MAX];
+	uint32_t line_contact_shadow_count = 0;
 	LightData *omni_lights = nullptr;
 	LightData *spot_lights = nullptr;
 	LightData *area_lights = nullptr;
@@ -876,6 +879,11 @@ public:
 	RID get_spot_light_buffer() { return spot_light_buffer; }
 	RID get_area_light_buffer() { return area_light_buffer; }
 	RID get_line_light_buffer() { return line_light_buffer; }
+	// Line lights given a contact shadow layer this frame, as indices into the line light buffer.
+	const uint32_t *get_line_contact_shadows(uint32_t &r_count) const {
+		r_count = line_contact_shadow_count;
+		return line_contact_shadows;
+	}
 	RID get_directional_light_buffer() { return directional_light_buffer; }
 	uint32_t get_max_directional_lights() { return max_directional_lights; }
 	uint32_t get_directional_light_blend_splits(uint32_t p_directional_light_count) const {

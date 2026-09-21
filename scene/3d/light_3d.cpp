@@ -361,8 +361,11 @@ void Light3D::_validate_property(PropertyInfo &p_property) const {
 		p_property.usage = PROPERTY_USAGE_NONE;
 	} else if (get_light_type() == RSE::LIGHT_AREA && p_property.name == "light_projector") {
 		p_property.usage = PROPERTY_USAGE_NONE;
-	} else if (get_light_type() != RSE::LIGHT_DIRECTIONAL && (p_property.name == "shadow_contact_shadows_allow" || p_property.name == "shadow_contact_shadows_opacity" || p_property.name == "shadow_contact_shadows_blur")) {
-		// Contact shadows are currently only supported on DirectionalLight3D.
+	} else if (get_light_type() == RSE::LIGHT_LINE && (p_property.name == "shadow_contact_shadows_opacity" || p_property.name == "shadow_contact_shadows_blur")) {
+		// Line light contact shadows join its shadow, so they share its opacity and softness.
+		p_property.usage = PROPERTY_USAGE_NONE;
+	} else if (get_light_type() != RSE::LIGHT_DIRECTIONAL && get_light_type() != RSE::LIGHT_LINE && (p_property.name == "shadow_contact_shadows_allow" || p_property.name == "shadow_contact_shadows_opacity" || p_property.name == "shadow_contact_shadows_blur")) {
+		// Contact shadows are only supported on DirectionalLight3D and LineLight3D.
 		p_property.usage = PROPERTY_USAGE_NONE;
 	}
 }

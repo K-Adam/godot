@@ -206,6 +206,7 @@ layout(set = 0, binding = 2) uniform sampler shadow_sampler;
 #define SCREEN_SPACE_EFFECTS_FLAGS_USE_SSR (1 << 2)
 #define SCREEN_SPACE_EFFECTS_FLAGS_RESOLVE_SSR (1 << 3)
 #define SCREEN_SPACE_EFFECTS_FLAGS_USE_SSCS (1 << 4)
+#define SCREEN_SPACE_EFFECTS_FLAGS_USE_LINE_SSCS (1 << 5)
 
 layout(set = 0, binding = 3, std430) restrict readonly buffer OmniLights {
 	LightData data[];
@@ -407,6 +408,9 @@ layout(set = 1, binding = 4) uniform texture2DArray reflection_atlas;
 layout(set = 1, binding = 5) uniform texture2D shadow_atlas;
 // Min-depth pyramid over the shadow atlas, for line light shadows.
 layout(set = 1, binding = 39) uniform texture2D line_shadow_pyramid;
+// Contact shadow hits per line light; see line_light_contact_shadows.glsl.
+#define USE_LINE_CONTACT_SHADOWS
+layout(set = 1, binding = 40) uniform texture2DArray line_contact_shadows;
 
 layout(set = 1, binding = 6) uniform texture2D directional_shadow_atlas;
 

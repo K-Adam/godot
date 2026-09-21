@@ -365,6 +365,11 @@ SSEffects::SSEffects() {
 			}
 
 			sscs.border_sampler = border_sampler;
+
+			sscs.line_shader.initialize(Vector<String>{ "", "\n#define MODE_FILTER\n" });
+			sscs.line_shader_version = sscs.line_shader.version_create();
+			sscs.line_pipeline.create_compute_pipeline(sscs.line_shader.version_get_shader(sscs.line_shader_version, 0));
+			sscs.line_filter_pipeline.create_compute_pipeline(sscs.line_shader.version_get_shader(sscs.line_shader_version, 1));
 		}
 	}
 
@@ -475,6 +480,9 @@ SSEffects::~SSEffects() {
 			sscs.sscs_pipelines[i].free();
 		}
 		sscs.sscs_shader.version_free(sscs.sscs_shader_version);
+		sscs.line_pipeline.free();
+		sscs.line_filter_pipeline.free();
+		sscs.line_shader.version_free(sscs.line_shader_version);
 
 		RD::get_singleton()->free_rid(sscs.border_sampler);
 	}
@@ -1875,6 +1883,87 @@ void SSEffects::screen_space_contact_shadows(Ref<RenderSceneBuffersRD> p_render_
 		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
 		RD::get_singleton()->compute_list_dispatch(compute_list, wave_size, bound_size.x, bound_size.y);
 		RD::get_singleton()->compute_list_end();
+	}
+
+	RD::get_singleton()->draw_command_end_label();
+}
+
+void SSEffects::line_light_contact_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, const SSCSSettings &p_settings, const Projection *p_projections, const RID *p_normal_roughness_slices, RID p_line_light_buffer, const uint32_t *p_lights, uint32_t p_light_count, float p_shadow_atlas_size, float p_taa_frame_count) {
+	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
+	ERR_FAIL_NULL(uniform_set_cache);
+
+	const uint32_t view_count = p_render_buffers->get_view_count();
+	const Size2i size = p_render_buffers->get_internal_size();
+
+	// Grows only, as the number of line lights in view changes.
+	uint32_t layers = p_light_count * view_count;
+	if (p_render_buffers->has_texture(RB_SCOPE_SSCS_LINE, RB_SSCS)) {
+		RD::TextureFormat current = p_render_buffers->get_texture_format(RB_SCOPE_SSCS_LINE, RB_SSCS);
+		if (current.array_layers < layers || current.width != (uint32_t)size.width || current.height != (uint32_t)size.height) {
+			layers = MAX(layers, current.array_layers);
+			p_render_buffers->clear_context(RB_SCOPE_SSCS_LINE);
+		}
+	}
+	if (!p_render_buffers->has_texture(RB_SCOPE_SSCS_LINE, RB_SSCS)) {
+		RD::TextureFormat tf;
+		tf.format = RD::DATA_FORMAT_R16_UNORM; // 4 bits per quarter of the light.
+		tf.width = size.width;
+		tf.height = size.height;
+		tf.array_layers = layers;
+		tf.texture_type = RD::TEXTURE_TYPE_2D_ARRAY;
+		tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT;
+		p_render_buffers->create_texture_from_format(RB_SCOPE_SSCS_LINE, RB_SSCS, tf);
+		// Unfiltered hits, reused by each light in turn.
+		tf.format = RD::DATA_FORMAT_R8_UNORM;
+		tf.array_layers = view_count;
+		p_render_buffers->create_texture_from_format(RB_SCOPE_SSCS_LINE, RB_SSCS_RAW, tf);
+	}
+
+	RD::get_singleton()->draw_command_begin_label("Line Light SSCS");
+
+	RID shader = sscs.line_shader.version_get_shader(sscs.line_shader_version, 0);
+	static const uint32_t steps[RSE::SCREEN_SPACE_CONTACT_SHADOWS_LENGTH_MAX] = { 8, 12, 16 };
+	static const float max_pixels[RSE::SCREEN_SPACE_CONTACT_SHADOWS_LENGTH_MAX] = { 64.0f, 128.0f, 192.0f };
+
+	LineLightContactShadowsPushConstant push_constant = {};
+	push_constant.screen_size[0] = size.width;
+	push_constant.screen_size[1] = size.height;
+	push_constant.steps = steps[p_settings.quality];
+	push_constant.max_pixels = max_pixels[p_settings.quality];
+	// As a fraction of view depth.
+	push_constant.thickness = p_settings.surface_thickness * 5.0f;
+	push_constant.taa_frame_count = p_taa_frame_count;
+	push_constant.shadow_atlas_size = p_shadow_atlas_size;
+
+	RD::Uniform u_lights(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, p_line_light_buffer);
+
+	RID filter_shader = sscs.line_shader.version_get_shader(sscs.line_shader_version, 1);
+	for (uint32_t v = 0; v < view_count; v++) {
+		store_camera(p_projections[v], push_constant.projection);
+		RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>{ sscs.border_sampler, p_render_buffers->get_depth_texture(v) });
+		RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>{ sscs.border_sampler, p_normal_roughness_slices[v] });
+		RID raw = p_render_buffers->get_texture_slice(RB_SCOPE_SSCS_LINE, RB_SSCS_RAW, v, 0);
+		RD::Uniform u_raw_output(RD::UNIFORM_TYPE_IMAGE, 1, raw);
+		RD::Uniform u_raw_input(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>{ sscs.border_sampler, raw });
+		for (uint32_t i = 0; i < p_light_count; i++) {
+			push_constant.light_index = p_lights[i];
+
+			// Separate lists, so the render graph orders the passes through `raw`.
+			RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
+			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.line_pipeline.get_rid());
+			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 0, u_depth, u_raw_output, u_lights, u_normal), 0);
+			RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+			RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+			RD::get_singleton()->compute_list_end();
+
+			RD::Uniform u_output(RD::UNIFORM_TYPE_IMAGE, 1, p_render_buffers->get_texture_slice(RB_SCOPE_SSCS_LINE, RB_SSCS, i * view_count + v, 0));
+			compute_list = RD::get_singleton()->compute_list_begin();
+			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.line_filter_pipeline.get_rid());
+			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(filter_shader, 0, u_depth, u_output, u_lights, u_normal, u_raw_input), 0);
+			RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+			RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+			RD::get_singleton()->compute_list_end();
+		}
 	}
 
 	RD::get_singleton()->draw_command_end_label();

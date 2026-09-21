@@ -31,6 +31,7 @@
 #pragma once
 
 #include "servers/rendering/renderer_rd/pipeline_deferred_rd.h"
+#include "servers/rendering/renderer_rd/shaders/effects/line_light_contact_shadows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_contact_shadows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_downsample.glsl.gen.h"
@@ -54,6 +55,7 @@
 #define RB_SCOPE_SSAO SNAME("rb_ssao")
 #define RB_SCOPE_SSR SNAME("rb_ssr")
 #define RB_SCOPE_SSCS SNAME("rb_sscs")
+#define RB_SCOPE_SSCS_LINE SNAME("rb_sscs_line")
 
 #define RB_LINEAR_DEPTH SNAME("linear_depth")
 #define RB_FINAL SNAME("final")
@@ -70,6 +72,7 @@
 #define RB_MIP_LEVEL SNAME("mip_level")
 
 #define RB_SSCS SNAME("sscs")
+#define RB_SSCS_RAW SNAME("sscs_raw")
 
 class RenderSceneBuffersRD;
 
@@ -176,6 +179,8 @@ public:
 
 	void sscs_allocate_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, SSCSRenderBuffers &p_sscs_buffers, uint32_t p_contact_shadow_count);
 	void screen_space_contact_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, SSCSRenderBuffers &p_sscs_buffers, const SSCSSettings &p_settings, const Projection *p_projections, Vector3 p_light_direction, uint32_t p_light_index, float p_opacity, float p_blur, float p_taa_frame_count);
+	// One layer per light in `p_lights` (line light buffer indices) and view.
+	void line_light_contact_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, const SSCSSettings &p_settings, const Projection *p_projections, const RID *p_normal_roughness_slices, RID p_line_light_buffer, const uint32_t *p_lights, uint32_t p_light_count, float p_shadow_atlas_size, float p_taa_frame_count);
 
 private:
 	/* Settings */
@@ -530,7 +535,22 @@ private:
 		PipelineDeferredRD sscs_pipelines[SCREEN_SPACE_CONTACT_SHADOWS_MAX];
 		RID border_sampler;
 
+		LineLightContactShadowsShaderRD line_shader;
+		RID line_shader_version;
+		PipelineDeferredRD line_pipeline;
+		PipelineDeferredRD line_filter_pipeline;
 	} sscs;
+
+	struct LineLightContactShadowsPushConstant {
+		float projection[16];
+		int32_t screen_size[2];
+		uint32_t light_index;
+		uint32_t steps;
+		float thickness;
+		float max_pixels;
+		float taa_frame_count;
+		float shadow_atlas_size;
+	};
 
 	struct ScreenSpaceContactShadowsPushConstant {
 		int32_t screen_size[2];
