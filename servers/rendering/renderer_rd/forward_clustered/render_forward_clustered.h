@@ -303,6 +303,8 @@ private:
 		SCREEN_SPACE_EFFECTS_FLAGS_RESOLVE_SSR = (1 << 3),
 		SCREEN_SPACE_EFFECTS_FLAGS_USE_SSCS = (1 << 4),
 		SCREEN_SPACE_EFFECTS_FLAGS_USE_LINE_SSCS = (1 << 5),
+		SCREEN_SPACE_EFFECTS_FLAGS_USE_LINE_SHADOW_PASS = (1 << 6),
+		SCREEN_SPACE_EFFECTS_FLAGS_LINE_SHADOW_PASS_CHECK_SURFACE = (1 << 7),
 	};
 
 	struct SceneState {
@@ -801,6 +803,9 @@ private:
 	void _copy_framebuffer_to_ss_effects(Ref<RenderSceneBuffersRD> p_render_buffers, bool p_use_ssil, bool p_use_ssr);
 	// Line light contact shadows are marched this frame and read by the opaque pass.
 	bool line_sscs_used = false;
+	// Line light shadows come from the screen-space pass this frame.
+	bool line_shadow_pass_used = false;
+	RID line_shadow_scene_data;
 	void _pre_opaque_render(RenderDataRD *p_render_data, bool p_use_ssao, bool p_use_ssil, bool p_use_ssr, bool p_use_sscs, bool p_use_gi, const RID *p_normal_roughness_slices, RID p_voxel_gi_buffer);
 	void _process_sss(Ref<RenderSceneBuffersRD> p_render_buffers, const Projection &p_camera);
 

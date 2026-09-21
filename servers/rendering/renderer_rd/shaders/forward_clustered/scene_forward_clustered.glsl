@@ -3279,5 +3279,18 @@ void main() {
 	}
 #endif
 
+#if !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED)
+	// With MSAA the line light shadow pass saw one sample, maybe of another surface.
+	float depth_fwidth = fwidth(gl_FragCoord.z);
+	if (bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_LINE_SHADOW_PASS_CHECK_SURFACE)) {
+#ifdef USE_MULTIVIEW
+		float resolved = texelFetch(sampler2DArray(depth_buffer, SAMPLER_NEAREST_CLAMP), ivec3(gl_FragCoord.xy, ViewIndex), 0).r;
+#else
+		float resolved = texelFetch(sampler2D(depth_buffer, SAMPLER_NEAREST_CLAMP), ivec2(gl_FragCoord.xy), 0).r;
+#endif
+		line_shadow_pass_match = abs(resolved - gl_FragCoord.z) <= 0.75 * depth_fwidth + 1e-3 * gl_FragCoord.z;
+	}
+#endif
+
 	fragment_shader(scene_data_block.data);
 }

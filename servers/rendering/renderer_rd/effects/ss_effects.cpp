@@ -370,6 +370,15 @@ SSEffects::SSEffects() {
 			sscs.line_shader_version = sscs.line_shader.version_create();
 			sscs.line_pipeline.create_compute_pipeline(sscs.line_shader.version_get_shader(sscs.line_shader_version, 0));
 			sscs.line_filter_pipeline.create_compute_pipeline(sscs.line_shader.version_get_shader(sscs.line_shader_version, 1));
+
+			String shadows_defines;
+#ifdef REAL_T_IS_DOUBLE
+			shadows_defines += "\n#define USE_DOUBLE_PRECISION\n";
+#endif
+			sscs.shadows_shader.initialize(Vector<String>{ "", "\n#define MODE_FILTER\n" }, shadows_defines);
+			sscs.shadows_shader_version = sscs.shadows_shader.version_create();
+			sscs.shadows_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 0));
+			sscs.shadows_filter_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 1));
 		}
 	}
 
@@ -482,6 +491,9 @@ SSEffects::~SSEffects() {
 		sscs.sscs_shader.version_free(sscs.sscs_shader_version);
 		sscs.line_pipeline.free();
 		sscs.line_filter_pipeline.free();
+		sscs.shadows_pipeline.free();
+		sscs.shadows_filter_pipeline.free();
+		sscs.shadows_shader.version_free(sscs.shadows_shader_version);
 		sscs.line_shader.version_free(sscs.line_shader_version);
 
 		RD::get_singleton()->free_rid(sscs.border_sampler);
@@ -1888,81 +1900,178 @@ void SSEffects::screen_space_contact_shadows(Ref<RenderSceneBuffersRD> p_render_
 	RD::get_singleton()->draw_command_end_label();
 }
 
-void SSEffects::line_light_contact_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, const SSCSSettings &p_settings, const Projection *p_projections, const RID *p_normal_roughness_slices, RID p_line_light_buffer, const uint32_t *p_lights, uint32_t p_light_count, float p_shadow_atlas_size, float p_taa_frame_count) {
-	UniformSetCacheRD *uniform_set_cache = UniformSetCacheRD::get_singleton();
-	ERR_FAIL_NULL(uniform_set_cache);
+void SSEffects::_line_light_contact_march(Ref<RenderSceneBuffersRD> p_render_buffers, const LineShadowParams &p_params, uint32_t p_view, uint32_t p_light, RID p_output) {
+	static const uint32_t steps[RSE::SCREEN_SPACE_CONTACT_SHADOWS_LENGTH_MAX] = { 8, 12, 16 };
+	static const float max_pixels[RSE::SCREEN_SPACE_CONTACT_SHADOWS_LENGTH_MAX] = { 64.0f, 128.0f, 192.0f };
+	const Size2i size = p_render_buffers->get_internal_size();
 
+	LineLightContactShadowsPushConstant push_constant = {};
+	store_camera(p_params.projections[p_view], push_constant.projection);
+	push_constant.screen_size[0] = size.width;
+	push_constant.screen_size[1] = size.height;
+	push_constant.light_index = p_params.lights[p_light];
+	push_constant.steps = steps[p_params.contact_settings.quality];
+	push_constant.max_pixels = max_pixels[p_params.contact_settings.quality];
+	// As a fraction of view depth.
+	push_constant.thickness = p_params.contact_settings.surface_thickness * 5.0f;
+	push_constant.taa_frame_count = p_params.taa_frame_count;
+	push_constant.shadow_atlas_size = p_params.shadow_atlas_size;
+
+	RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>{ sscs.border_sampler, p_render_buffers->get_depth_texture(p_view) });
+	RD::Uniform u_output(RD::UNIFORM_TYPE_IMAGE, 1, p_output);
+	RD::Uniform u_lights(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, p_params.line_light_buffer);
+	RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>{ sscs.border_sampler, p_params.normal_roughness_slices[p_view] });
+	RID shader = sscs.line_shader.version_get_shader(sscs.line_shader_version, 0);
+
+	// One list per dispatch, so the render graph orders the passes that share textures.
+	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
+	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.line_pipeline.get_rid());
+	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(shader, 0, u_depth, u_output, u_lights, u_normal), 0);
+	RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+	RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+	RD::get_singleton()->compute_list_end();
+}
+
+// Grows only. False when `p_scope` must be recreated to hold `r_layers` layers.
+static bool _line_shadow_textures_fit(Ref<RenderSceneBuffersRD> p_render_buffers, const StringName &p_scope, const StringName &p_name, uint32_t &r_layers) {
+	const Size2i size = p_render_buffers->get_internal_size();
+	if (p_render_buffers->has_texture(p_scope, p_name)) {
+		RD::TextureFormat current = p_render_buffers->get_texture_format(p_scope, p_name);
+		if (current.array_layers >= r_layers && current.width == (uint32_t)size.width && current.height == (uint32_t)size.height) {
+			return true;
+		}
+		r_layers = MAX(r_layers, current.array_layers);
+		p_render_buffers->clear_context(p_scope);
+	}
+	return false;
+}
+
+static void _line_shadow_texture_create(Ref<RenderSceneBuffersRD> p_render_buffers, const StringName &p_scope, const StringName &p_name, RD::DataFormat p_format, uint32_t p_layers) {
+	RD::TextureFormat tf;
+	tf.format = p_format;
+	tf.width = p_render_buffers->get_internal_size().width;
+	tf.height = p_render_buffers->get_internal_size().height;
+	tf.array_layers = p_layers;
+	tf.texture_type = RD::TEXTURE_TYPE_2D_ARRAY;
+	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT;
+	p_render_buffers->create_texture_from_format(p_scope, p_name, tf);
+}
+
+void SSEffects::line_light_contact_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, const LineShadowParams &p_params) {
 	const uint32_t view_count = p_render_buffers->get_view_count();
 	const Size2i size = p_render_buffers->get_internal_size();
 
-	// Grows only, as the number of line lights in view changes.
-	uint32_t layers = p_light_count * view_count;
-	if (p_render_buffers->has_texture(RB_SCOPE_SSCS_LINE, RB_SSCS)) {
-		RD::TextureFormat current = p_render_buffers->get_texture_format(RB_SCOPE_SSCS_LINE, RB_SSCS);
-		if (current.array_layers < layers || current.width != (uint32_t)size.width || current.height != (uint32_t)size.height) {
-			layers = MAX(layers, current.array_layers);
-			p_render_buffers->clear_context(RB_SCOPE_SSCS_LINE);
-		}
-	}
-	if (!p_render_buffers->has_texture(RB_SCOPE_SSCS_LINE, RB_SSCS)) {
-		RD::TextureFormat tf;
-		tf.format = RD::DATA_FORMAT_R16_UNORM; // 4 bits per quarter of the light.
-		tf.width = size.width;
-		tf.height = size.height;
-		tf.array_layers = layers;
-		tf.texture_type = RD::TEXTURE_TYPE_2D_ARRAY;
-		tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT;
-		p_render_buffers->create_texture_from_format(RB_SCOPE_SSCS_LINE, RB_SSCS, tf);
-		// Unfiltered hits, reused by each light in turn.
-		tf.format = RD::DATA_FORMAT_R8_UNORM;
-		tf.array_layers = view_count;
-		p_render_buffers->create_texture_from_format(RB_SCOPE_SSCS_LINE, RB_SSCS_RAW, tf);
+	uint32_t layers = p_params.light_count * view_count;
+	uint32_t raw_layers = p_params.keep_raw_contact ? layers : view_count;
+	if (!_line_shadow_textures_fit(p_render_buffers, RB_SCOPE_SSCS_LINE, RB_SSCS, layers) || !_line_shadow_textures_fit(p_render_buffers, RB_SCOPE_SSCS_LINE, RB_SSCS_RAW, raw_layers)) {
+		p_render_buffers->clear_context(RB_SCOPE_SSCS_LINE);
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_SSCS_LINE, RB_SSCS, RD::DATA_FORMAT_R16_UNORM, layers); // 4 bits per quarter of the light.
+		// Unfiltered hits, per light when line_light_shadows() reads them.
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_SSCS_LINE, RB_SSCS_RAW, RD::DATA_FORMAT_R8_UNORM, raw_layers);
 	}
 
 	RD::get_singleton()->draw_command_begin_label("Line Light SSCS");
 
-	RID shader = sscs.line_shader.version_get_shader(sscs.line_shader_version, 0);
-	static const uint32_t steps[RSE::SCREEN_SPACE_CONTACT_SHADOWS_LENGTH_MAX] = { 8, 12, 16 };
-	static const float max_pixels[RSE::SCREEN_SPACE_CONTACT_SHADOWS_LENGTH_MAX] = { 64.0f, 128.0f, 192.0f };
-
 	LineLightContactShadowsPushConstant push_constant = {};
 	push_constant.screen_size[0] = size.width;
 	push_constant.screen_size[1] = size.height;
-	push_constant.steps = steps[p_settings.quality];
-	push_constant.max_pixels = max_pixels[p_settings.quality];
-	// As a fraction of view depth.
-	push_constant.thickness = p_settings.surface_thickness * 5.0f;
-	push_constant.taa_frame_count = p_taa_frame_count;
-	push_constant.shadow_atlas_size = p_shadow_atlas_size;
-
-	RD::Uniform u_lights(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, p_line_light_buffer);
-
 	RID filter_shader = sscs.line_shader.version_get_shader(sscs.line_shader_version, 1);
+	RD::Uniform u_lights(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, p_params.line_light_buffer);
 	for (uint32_t v = 0; v < view_count; v++) {
-		store_camera(p_projections[v], push_constant.projection);
+		store_camera(p_params.projections[v], push_constant.projection);
 		RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>{ sscs.border_sampler, p_render_buffers->get_depth_texture(v) });
-		RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>{ sscs.border_sampler, p_normal_roughness_slices[v] });
-		RID raw = p_render_buffers->get_texture_slice(RB_SCOPE_SSCS_LINE, RB_SSCS_RAW, v, 0);
-		RD::Uniform u_raw_output(RD::UNIFORM_TYPE_IMAGE, 1, raw);
-		RD::Uniform u_raw_input(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>{ sscs.border_sampler, raw });
-		for (uint32_t i = 0; i < p_light_count; i++) {
-			push_constant.light_index = p_lights[i];
-
-			// Separate lists, so the render graph orders the passes through `raw`.
-			RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
-			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.line_pipeline.get_rid());
-			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 0, u_depth, u_raw_output, u_lights, u_normal), 0);
-			RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
-			RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
-			RD::get_singleton()->compute_list_end();
+		RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>{ sscs.border_sampler, p_params.normal_roughness_slices[v] });
+		for (uint32_t i = 0; i < p_params.light_count; i++) {
+			if (!p_params.contact[i]) {
+				continue; // Its layers are never read.
+			}
+			RID raw = p_render_buffers->get_texture_slice(RB_SCOPE_SSCS_LINE, RB_SSCS_RAW, p_params.keep_raw_contact ? i * view_count + v : v, 0);
+			RD::Uniform u_raw_input(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>{ sscs.border_sampler, raw });
+			_line_light_contact_march(p_render_buffers, p_params, v, i, raw);
 
 			RD::Uniform u_output(RD::UNIFORM_TYPE_IMAGE, 1, p_render_buffers->get_texture_slice(RB_SCOPE_SSCS_LINE, RB_SSCS, i * view_count + v, 0));
-			compute_list = RD::get_singleton()->compute_list_begin();
+			RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.line_filter_pipeline.get_rid());
-			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(filter_shader, 0, u_depth, u_output, u_lights, u_normal, u_raw_input), 0);
+			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(filter_shader, 0, u_depth, u_output, u_lights, u_normal, u_raw_input), 0);
 			RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
 			RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
 			RD::get_singleton()->compute_list_end();
+		}
+	}
+
+	RD::get_singleton()->draw_command_end_label();
+}
+
+void SSEffects::line_light_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, const LineShadowParams &p_params) {
+	MaterialStorage *material_storage = MaterialStorage::get_singleton();
+	ERR_FAIL_NULL(material_storage);
+	TextureStorage *texture_storage = TextureStorage::get_singleton();
+	const uint32_t view_count = p_render_buffers->get_view_count();
+	const Size2i size = p_render_buffers->get_internal_size();
+
+	uint32_t layers = p_params.light_count * view_count;
+	if (!_line_shadow_textures_fit(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY, layers)) {
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY, RD::DATA_FORMAT_R16G16_UNORM, layers);
+		// Reused by each light in turn.
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY_TEMP, RD::DATA_FORMAT_R16G16_UNORM, view_count);
+	}
+
+	RD::get_singleton()->draw_command_begin_label("Line Light Shadows");
+
+	RID shader = sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 0);
+	RID filter_shader = sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 1);
+	RID nearest = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RID linear = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
+	RD::Uniform u_lights(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, p_params.line_light_buffer);
+	RD::Uniform u_atlas(RD::UNIFORM_TYPE_TEXTURE, 5, p_params.shadow_atlas);
+	RD::Uniform u_pyramid(RD::UNIFORM_TYPE_TEXTURE, 6, p_params.line_pyramid);
+	RD::Uniform u_nearest(RD::UNIFORM_TYPE_SAMPLER, 7, nearest);
+	RD::Uniform u_linear(RD::UNIFORM_TYPE_SAMPLER, 8, linear);
+	RD::Uniform u_lut1(RD::UNIFORM_TYPE_TEXTURE, 9, p_params.ltc_lut1);
+	RD::Uniform u_lut2(RD::UNIFORM_TYPE_TEXTURE, 10, p_params.ltc_lut2);
+	RD::Uniform u_scene(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 11, p_params.scene_data);
+
+	LineLightShadowsPushConstant push_constant = {};
+	push_constant.screen_size[0] = size.width;
+	push_constant.screen_size[1] = size.height;
+	push_constant.taa_frame_count = p_params.taa_frame_count;
+
+	for (uint32_t v = 0; v < view_count; v++) {
+		push_constant.view = v;
+		RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>{ nearest, p_render_buffers->get_depth_texture(v) });
+		RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>{ nearest, p_params.normal_roughness_slices[v] });
+		RID temp = p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY_TEMP, v, 0);
+
+		for (uint32_t i = 0; i < p_params.light_count; i++) {
+			RID layer = p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY, i * view_count + v, 0);
+			push_constant.light_index = p_params.lights[i];
+			push_constant.use_contact = p_params.contact[i];
+			RID contact = p_params.contact[i] ? p_render_buffers->get_texture_slice(RB_SCOPE_SSCS_LINE, RB_SSCS_RAW, i * view_count + v, 0) : texture_storage->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+			RD::Uniform u_raw(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>{ nearest, contact });
+
+			// Ping-pong so the last pass lands in the light's layer.
+			RID target = p_params.filter_passes % 2 == 0 ? layer : temp;
+			RD::Uniform u_output(RD::UNIFORM_TYPE_IMAGE, 1, target);
+			RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
+			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_pipeline.get_rid());
+			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(shader, 0, u_depth, u_output, u_lights, u_normal, u_raw, u_atlas, u_pyramid, u_nearest, u_linear, u_lut1, u_lut2, u_scene), 0);
+			RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+			RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+			RD::get_singleton()->compute_list_end();
+
+			for (int pass = 0; pass < p_params.filter_passes; pass++) {
+				RID source = target;
+				target = target == layer ? temp : layer;
+				push_constant.tap_step = 1 << pass;
+				RD::Uniform u_source(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>{ nearest, source });
+				RD::Uniform u_target(RD::UNIFORM_TYPE_IMAGE, 1, target);
+				compute_list = RD::get_singleton()->compute_list_begin();
+				RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_filter_pipeline.get_rid());
+				RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(filter_shader, 0, u_depth, u_target, u_normal, u_source, u_scene), 0);
+				RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+				RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+				RD::get_singleton()->compute_list_end();
+			}
 		}
 	}
 

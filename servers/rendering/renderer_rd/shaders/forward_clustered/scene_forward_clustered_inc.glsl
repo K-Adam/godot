@@ -207,6 +207,8 @@ layout(set = 0, binding = 2) uniform sampler shadow_sampler;
 #define SCREEN_SPACE_EFFECTS_FLAGS_RESOLVE_SSR (1 << 3)
 #define SCREEN_SPACE_EFFECTS_FLAGS_USE_SSCS (1 << 4)
 #define SCREEN_SPACE_EFFECTS_FLAGS_USE_LINE_SSCS (1 << 5)
+#define SCREEN_SPACE_EFFECTS_FLAGS_USE_LINE_SHADOW_PASS (1 << 6)
+#define SCREEN_SPACE_EFFECTS_FLAGS_LINE_SHADOW_PASS_CHECK_SURFACE (1 << 7)
 
 layout(set = 0, binding = 3, std430) restrict readonly buffer OmniLights {
 	LightData data[];
@@ -411,6 +413,11 @@ layout(set = 1, binding = 39) uniform texture2D line_shadow_pyramid;
 // Contact shadow hits per line light; see line_light_contact_shadows.glsl.
 #define USE_LINE_CONTACT_SHADOWS
 layout(set = 1, binding = 40) uniform texture2DArray line_contact_shadows;
+// Filtered line light visibility per light; see line_light_shadows.glsl.
+#define USE_LINE_SHADOW_PASS
+layout(set = 1, binding = 41) uniform texture2DArray line_shadow_pass_buffer;
+// Whether this fragment is the surface the pass saw; see main().
+bool line_shadow_pass_match = true;
 
 layout(set = 1, binding = 6) uniform texture2D directional_shadow_atlas;
 

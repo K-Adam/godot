@@ -32,6 +32,7 @@
 
 #include "servers/rendering/renderer_rd/pipeline_deferred_rd.h"
 #include "servers/rendering/renderer_rd/shaders/effects/line_light_contact_shadows.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/effects/line_light_shadows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_contact_shadows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/screen_space_reflection_downsample.glsl.gen.h"
@@ -56,6 +57,7 @@
 #define RB_SCOPE_SSR SNAME("rb_ssr")
 #define RB_SCOPE_SSCS SNAME("rb_sscs")
 #define RB_SCOPE_SSCS_LINE SNAME("rb_sscs_line")
+#define RB_SCOPE_LINE_SHADOWS SNAME("rb_line_shadows")
 
 #define RB_LINEAR_DEPTH SNAME("linear_depth")
 #define RB_FINAL SNAME("final")
@@ -73,6 +75,8 @@
 
 #define RB_SSCS SNAME("sscs")
 #define RB_SSCS_RAW SNAME("sscs_raw")
+#define RB_LINE_VISIBILITY SNAME("visibility")
+#define RB_LINE_VISIBILITY_TEMP SNAME("visibility_temp")
 
 class RenderSceneBuffersRD;
 
@@ -179,8 +183,31 @@ public:
 
 	void sscs_allocate_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, SSCSRenderBuffers &p_sscs_buffers, uint32_t p_contact_shadow_count);
 	void screen_space_contact_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, SSCSRenderBuffers &p_sscs_buffers, const SSCSSettings &p_settings, const Projection *p_projections, Vector3 p_light_direction, uint32_t p_light_index, float p_opacity, float p_blur, float p_taa_frame_count);
-	// One layer per light in `p_lights` (line light buffer indices) and view.
-	void line_light_contact_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, const SSCSSettings &p_settings, const Projection *p_projections, const RID *p_normal_roughness_slices, RID p_line_light_buffer, const uint32_t *p_lights, uint32_t p_light_count, float p_shadow_atlas_size, float p_taa_frame_count);
+
+	struct LineShadowParams {
+		const uint32_t *lights = nullptr; // Line light buffer indices; one layer each per view.
+		const bool *contact = nullptr; // Per light: whether to march contact shadows.
+		bool keep_raw_contact = false; // Keep each light's unfiltered hits for line_light_shadows().
+		uint32_t light_count = 0;
+		const Projection *projections = nullptr;
+		const RID *normal_roughness_slices = nullptr;
+		RID line_light_buffer;
+		float shadow_atlas_size = 0.0;
+		float taa_frame_count = 0.0;
+		SSCSSettings contact_settings;
+
+		// line_light_shadows() only.
+		RID scene_data;
+		RID shadow_atlas;
+		RID line_pyramid;
+		RID ltc_lut1;
+		RID ltc_lut2;
+		int filter_passes = 1;
+	};
+	// Contact shadow hits only.
+	void line_light_contact_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, const LineShadowParams &p_params);
+	// The filtered line light shadow; runs after line_light_contact_shadows().
+	void line_light_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, const LineShadowParams &p_params);
 
 private:
 	/* Settings */
@@ -539,6 +566,11 @@ private:
 		RID line_shader_version;
 		PipelineDeferredRD line_pipeline;
 		PipelineDeferredRD line_filter_pipeline;
+
+		LineLightShadowsShaderRD shadows_shader;
+		RID shadows_shader_version;
+		PipelineDeferredRD shadows_pipeline;
+		PipelineDeferredRD shadows_filter_pipeline;
 	} sscs;
 
 	struct LineLightContactShadowsPushConstant {
@@ -551,6 +583,19 @@ private:
 		float taa_frame_count;
 		float shadow_atlas_size;
 	};
+
+	struct LineLightShadowsPushConstant {
+		int32_t screen_size[2];
+		uint32_t light_index;
+		uint32_t view;
+		uint32_t use_contact;
+		int32_t tap_step;
+		float taa_frame_count;
+		float pad;
+	};
+
+	// Marches light `p_light` for view `p_view` into the R8 image `p_output`.
+	void _line_light_contact_march(Ref<RenderSceneBuffersRD> p_render_buffers, const LineShadowParams &p_params, uint32_t p_view, uint32_t p_light, RID p_output);
 
 	struct ScreenSpaceContactShadowsPushConstant {
 		int32_t screen_size[2];

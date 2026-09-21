@@ -125,6 +125,7 @@ void RenderForwardClustered::RenderBufferDataForwardClustered::free_data() {
 		render_buffers->clear_context(RB_SCOPE_SSR);
 		render_buffers->clear_context(RB_SCOPE_SSCS);
 		render_buffers->clear_context(RB_SCOPE_SSCS_LINE);
+		render_buffers->clear_context(RB_SCOPE_LINE_SHADOWS);
 	}
 
 	if (cluster_builder) {
@@ -785,6 +786,13 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
 		scene_state.ubo.ss_effects_flags = ss_flags;
 	} else {
 		scene_state.ubo.ss_effects_flags = 0;
+	}
+	if (p_opaque_render_buffers && line_shadow_pass_used && p_render_data->reflection_probe.is_null() && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED) {
+		scene_state.ubo.ss_effects_flags |= SCREEN_SPACE_EFFECTS_FLAGS_USE_LINE_SHADOW_PASS;
+		// With MSAA a fragment can belong to another surface than the resolved pixel.
+		if (rd.is_valid() && rd->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
+			scene_state.ubo.ss_effects_flags |= SCREEN_SPACE_EFFECTS_FLAGS_LINE_SHADOW_PASS_CHECK_SURFACE;
+		}
 	}
 
 	if (uniform_buffer_index >= scene_state.implementation_uniform_buffers.size()) {
@@ -1752,21 +1760,60 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 	texture_storage->update_decal_buffer(*p_render_data->decals, p_render_data->scene_data->cam_transform);
 
 	// After update_light_buffers(), which picks the lights and fills their buffer.
-	uint32_t line_contact_count = 0;
-	const uint32_t *line_contact_lights = light_storage->get_line_contact_shadows(line_contact_count);
-	line_sscs_used = line_sscs_used && rb_data.is_valid() && ss_effects && line_contact_count > 0 && p_normal_roughness_slices[0].is_valid();
-	if (line_sscs_used) {
-		RENDER_TIMESTAMP("Process Line Light SSCS");
-		RendererRD::SSEffects::SSCSSettings settings;
-		settings.quality = RSE::ScreenSpaceContactShadowsLength(GLOBAL_GET_CACHED(int, "rendering/lights_and_shadows/contact_shadow/shadow_length"));
-		settings.surface_thickness = GLOBAL_GET_CACHED(float, "rendering/lights_and_shadows/contact_shadow/surface_thickness");
-		Projection projections[RendererSceneRender::MAX_RENDER_VIEWS];
-		for (uint32_t v = 0; v < p_render_data->scene_data->view_count; v++) {
-			projections[v] = p_render_data->scene_data->get_view_projection(v);
+	{
+		RendererRD::SSEffects::LineShadowParams params;
+		params.lights = light_storage->get_line_screen_shadows(params.light_count, params.contact);
+		bool ready = rb_data.is_valid() && ss_effects && params.light_count > 0 && p_normal_roughness_slices[0].is_valid() && light_storage->shadow_atlas_get_line_pyramid(p_render_data->shadow_atlas).is_valid();
+		bool any_contact = false;
+		bool contact[RendererRD::LightStorage::LINE_SCREEN_SHADOWS_MAX];
+		for (uint32_t i = 0; i < params.light_count; i++) {
+			contact[i] = p_use_sscs && params.contact[i];
+			any_contact = any_contact || contact[i];
 		}
-		ss_effects->line_light_contact_shadows(rb, settings, projections, p_normal_roughness_slices, light_storage->get_line_light_buffer(), line_contact_lights, line_contact_count, light_storage->shadow_atlas_get_size(p_render_data->shadow_atlas), p_render_data->scene_data->taa_frame_count);
-	} else if (rb_data.is_valid() && rb->has_texture(RB_SCOPE_SSCS_LINE, RB_SSCS)) {
-		rb->clear_context(RB_SCOPE_SSCS_LINE);
+		line_shadow_pass_used = line_shadow_pass_used && ready;
+		line_sscs_used = line_sscs_used && ready && any_contact;
+		for (uint32_t i = 0; i < params.light_count; i++) {
+			contact[i] = contact[i] && line_sscs_used;
+		}
+
+		if (line_shadow_pass_used || line_sscs_used) {
+			params.contact = contact;
+			params.contact_settings.quality = RSE::ScreenSpaceContactShadowsLength(GLOBAL_GET_CACHED(int, "rendering/lights_and_shadows/contact_shadow/shadow_length"));
+			params.contact_settings.surface_thickness = GLOBAL_GET_CACHED(float, "rendering/lights_and_shadows/contact_shadow/surface_thickness");
+			Projection projections[RendererSceneRender::MAX_RENDER_VIEWS];
+			for (uint32_t v = 0; v < p_render_data->scene_data->view_count; v++) {
+				projections[v] = p_render_data->scene_data->get_view_projection(v);
+			}
+			params.projections = projections;
+			params.normal_roughness_slices = p_normal_roughness_slices;
+			params.line_light_buffer = light_storage->get_line_light_buffer();
+			params.shadow_atlas_size = light_storage->shadow_atlas_get_size(p_render_data->shadow_atlas);
+			params.taa_frame_count = p_render_data->scene_data->taa_frame_count;
+			params.keep_raw_contact = line_shadow_pass_used;
+			if (line_sscs_used) {
+				RENDER_TIMESTAMP("Process Line Light SSCS");
+				ss_effects->line_light_contact_shadows(rb, params);
+			}
+			if (line_shadow_pass_used) {
+				RENDER_TIMESTAMP("Process Line Light Shadows");
+				RendererRD::TextureStorage *rd_texture_storage = RendererRD::TextureStorage::get_singleton();
+				params.scene_data = line_shadow_scene_data;
+				params.shadow_atlas = light_storage->shadow_atlas_get_texture(p_render_data->shadow_atlas);
+				params.line_pyramid = light_storage->shadow_atlas_get_line_pyramid(p_render_data->shadow_atlas);
+				params.ltc_lut1 = rd_texture_storage->texture_get_rd_texture(ltc.lut1_texture);
+				params.ltc_lut2 = rd_texture_storage->texture_get_rd_texture(ltc.lut2_texture);
+				params.filter_passes = GLOBAL_GET_CACHED(int, "rendering/lights_and_shadows/positional_shadow/line_light_shadow_filter");
+				ss_effects->line_light_shadows(rb, params);
+			}
+		}
+		if (rb_data.is_valid()) {
+			if (!line_sscs_used && rb->has_texture(RB_SCOPE_SSCS_LINE, RB_SSCS)) {
+				rb->clear_context(RB_SCOPE_SSCS_LINE);
+			}
+			if (!line_shadow_pass_used && rb->has_texture(RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY)) {
+				rb->clear_context(RB_SCOPE_LINE_SHADOWS);
+			}
+		}
 	}
 
 	p_render_data->directional_light_count = directional_light_count;
@@ -2029,6 +2076,16 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	RD::get_singleton()->draw_command_end_label();
 
+	// Line light shadows in screen space read the normal-roughness prepass.
+	bool want_line_shadow_pass = false;
+	if (!is_reflection_probe && rb_data.is_valid() && (scene_shader.depth_prepass_enabled || scene_state.used_opaque_stencil) && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED && GLOBAL_GET_CACHED(int, "rendering/lights_and_shadows/positional_shadow/line_light_shadow_filter") > 0) {
+		RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+		for (uint32_t i = 0; i < p_render_data->lights->size() && !want_line_shadow_pass; i++) {
+			RID base = light_storage->light_instance_get_base_light((*p_render_data->lights)[i]);
+			want_line_shadow_pass = light_storage->light_get_type(base) == RSE::LIGHT_LINE && light_storage->light_has_shadow(base);
+		}
+	}
+
 	if (!is_reflection_probe) {
 		if (using_voxelgi) {
 			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI;
@@ -2044,6 +2101,9 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 				depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
 			}
 		} else if (get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_NORMAL_BUFFER || scene_state.used_normal_texture) {
+			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
+		}
+		if (want_line_shadow_pass && depth_pass_mode == PASS_MODE_DEPTH) {
 			depth_pass_mode = PASS_MODE_DEPTH_NORMAL_ROUGHNESS;
 		}
 
@@ -2289,6 +2349,8 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	}
 	// Line light contact shadows march the finished depth prepass.
 	line_sscs_used = using_sscs && depth_pre_pass && is_environment(p_render_data->environment) && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED;
+	line_shadow_pass_used = want_line_shadow_pass && depth_pre_pass;
+	line_shadow_scene_data = scene_state.uniform_buffers[depth_prepass_uniform_buffer_index];
 	_pre_opaque_render(p_render_data, using_ssao, using_ssil, using_ssr, using_sscs, using_sdfgi || using_voxelgi, normal_roughness_views, rb_data.is_valid() && rb_data->has_voxelgi() ? rb_data->get_voxelgi() : RID());
 
 	if (current_cluster_builder) {
@@ -3785,7 +3847,10 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		u.binding = 24;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 		RID texture;
-		if (rb.is_valid() && rb->has_texture(RB_SCOPE_BUFFERS, RB_TEX_BACK_DEPTH)) {
+		if (rb.is_valid() && p_render_list != RENDER_LIST_ALPHA && line_shadow_pass_used && rb->get_msaa_3d() != RSE::VIEWPORT_MSAA_DISABLED) {
+			// Only line light shadows read it in the opaque lists.
+			texture = rb->get_depth_texture();
+		} else if (rb.is_valid() && rb->has_texture(RB_SCOPE_BUFFERS, RB_TEX_BACK_DEPTH)) {
 			texture = rb->get_texture(RB_SCOPE_BUFFERS, RB_TEX_BACK_DEPTH);
 		} else {
 			texture = texture_storage->texture_rd_get_default(is_multiview ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_DEPTH : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_DEPTH);
@@ -3964,6 +4029,17 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 			texture = rb->get_texture(RB_SCOPE_SSCS_LINE, RB_SSCS);
 		}
 		u.append_id(texture.is_valid() ? texture : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK));
+		uniforms.push_back(u);
+	}
+	{
+		RD::Uniform u;
+		u.binding = 41;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		RID texture;
+		if (rb_data.is_valid() && rb->has_texture(RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY)) {
+			texture = rb->get_texture(RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY);
+		}
+		u.append_id(texture.is_valid() ? texture : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE));
 		uniforms.push_back(u);
 	}
 #ifdef MODULE_TEXTURE_STREAMING_ENABLED

@@ -899,7 +899,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 	spot_light_count = 0;
 	area_light_count = 0;
 	line_light_count = 0;
-	line_contact_shadow_count = 0;
+	line_screen_shadow_count = 0;
 	uint32_t directional_contact_shadows_count = 0;
 
 	// The positional light types are packed identically; only the arrays they
@@ -1408,10 +1408,11 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 						}
 					}
 
-					// Contact shadow layer + 1, nearest lights first; 0 is none.
-					if (light->allow_contact_shadows && light_data.shadow_opacity > 0.0 && line_contact_shadow_count < LINE_CONTACT_SHADOWS_MAX) {
-						line_contact_shadows[line_contact_shadow_count++] = index;
-						light_data.cos_spot_angle = float(line_contact_shadow_count);
+					// Screen-space layer, nearest lights first.
+					if (light_data.shadow_opacity > 0.0 && line_screen_shadow_count < LINE_SCREEN_SHADOWS_MAX) {
+						line_screen_shadow_contact[line_screen_shadow_count] = light->allow_contact_shadows;
+						line_screen_shadows[line_screen_shadow_count++] = index;
+						light_data.cos_spot_angle = light->allow_contact_shadows ? float(line_screen_shadow_count) : -float(line_screen_shadow_count);
 					}
 				} else if (type == RSE::LIGHT_SPOT) {
 					Transform3D modelview = (inverse_transform * light_transform).inverse();

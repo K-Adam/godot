@@ -53,6 +53,9 @@ public:
 		SHADOW_INVALID = 0xFFFFFFFF
 	};
 
+	// Shadowed line lights given a screen-space layer per frame.
+	static constexpr uint32_t LINE_SCREEN_SHADOWS_MAX = 8;
+
 private:
 	static LightStorage *singleton;
 	uint32_t max_cluster_elements = 512;
@@ -163,7 +166,7 @@ private:
 		float inv_spot_attenuation; // area lights: 1 / (range + diagonal/2)
 
 		float area_height[3];
-		float cos_spot_angle; // area lights: max mipmaps; line lights: contact shadow layer + 1, or 0
+		float cos_spot_angle; // area lights: max mipmaps; line lights: screen-space layer + 1, negative without contact shadows, or 0
 
 		float specular_amount;
 		float shadow_opacity;
@@ -196,9 +199,9 @@ private:
 	uint32_t spot_light_count = 0;
 	uint32_t area_light_count = 0;
 	uint32_t line_light_count = 0;
-	static constexpr uint32_t LINE_CONTACT_SHADOWS_MAX = 8;
-	uint32_t line_contact_shadows[LINE_CONTACT_SHADOWS_MAX];
-	uint32_t line_contact_shadow_count = 0;
+	uint32_t line_screen_shadows[LINE_SCREEN_SHADOWS_MAX];
+	bool line_screen_shadow_contact[LINE_SCREEN_SHADOWS_MAX];
+	uint32_t line_screen_shadow_count = 0;
 	LightData *omni_lights = nullptr;
 	LightData *spot_lights = nullptr;
 	LightData *area_lights = nullptr;
@@ -879,10 +882,11 @@ public:
 	RID get_spot_light_buffer() { return spot_light_buffer; }
 	RID get_area_light_buffer() { return area_light_buffer; }
 	RID get_line_light_buffer() { return line_light_buffer; }
-	// Line lights given a contact shadow layer this frame, as indices into the line light buffer.
-	const uint32_t *get_line_contact_shadows(uint32_t &r_count) const {
-		r_count = line_contact_shadow_count;
-		return line_contact_shadows;
+	// Indices into the line light buffer, and whether each has contact shadows.
+	const uint32_t *get_line_screen_shadows(uint32_t &r_count, const bool *&r_contact) const {
+		r_count = line_screen_shadow_count;
+		r_contact = line_screen_shadow_contact;
+		return line_screen_shadows;
 	}
 	RID get_directional_light_buffer() { return directional_light_buffer; }
 	uint32_t get_max_directional_lights() { return max_directional_lights; }
