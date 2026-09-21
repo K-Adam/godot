@@ -396,3 +396,46 @@ void ltc_evaluate_diff(vec3 normal, vec3 points[4], vec4 texture_rect, float max
 	float I = ltc_integrate_clipped_quad(L, L_proj, n);
 	integral = I; // no division by (2.0 * M_PI) for GI calculations
 }
+
+// Line lights, copied from area_lights_inc.glsl; see there.
+#define LINE_LIGHT_MIN_DISTANCE 0.001
+
+float line_Fpo(float p_d, float p_l) {
+	return p_l / (p_d * (p_d * p_d + p_l * p_l)) + atan(p_l, p_d) / (p_d * p_d);
+}
+
+float line_Fwt(float p_d, float p_l) {
+	return p_l * p_l / (p_d * (p_d * p_d + p_l * p_l));
+}
+
+// Exact clamped-cosine integral over the segment p1..p2, shading point at the origin,
+// divided by PI.
+float line_integrate_diffuse(vec3 p1, vec3 p2, vec3 n, float min_distance) {
+	float n1 = dot(p1, n);
+	float n2 = dot(p2, n);
+	if (n1 <= 0.0 && n2 <= 0.0) {
+		return 0.0;
+	}
+
+	vec3 wt = normalize(p2 - p1);
+
+	// Clip to the horizon.
+	if (n1 < 0.0) {
+		p1 = (p1 * n2 - p2 * n1) / (n2 - n1);
+	} else if (n2 < 0.0) {
+		p2 = (p2 * n1 - p1 * n2) / (n1 - n2);
+	}
+
+	float l1 = dot(p1, wt);
+	float l2 = dot(p2, wt);
+	vec3 po = p1 - l1 * wt;
+
+	// Push the shading point out to min_distance, the stand-in for a tube of that radius.
+	float d0 = length(po);
+	float d = max(d0, max(min_distance, LINE_LIGHT_MIN_DISTANCE));
+	po *= d / max(d0, 1e-9);
+
+	float I = (line_Fpo(d, l2) - line_Fpo(d, l1)) * dot(po, n) +
+			(line_Fwt(d, l2) - line_Fwt(d, l1)) * dot(wt, n);
+	return 0.5 * I / M_PI;
+}

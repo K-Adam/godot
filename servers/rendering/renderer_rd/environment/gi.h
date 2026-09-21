@@ -556,6 +556,8 @@ public:
 	class SDFGI : public RenderBufferCustomDataRD {
 		GDCLASS(SDFGI, RenderBufferCustomDataRD)
 
+		static void _fill_line_light(SDFGIShader::Light &r_light, RID p_light, const Transform3D &p_transform, float p_y_mult);
+
 	public:
 		enum {
 			MAX_CASCADES = 8,

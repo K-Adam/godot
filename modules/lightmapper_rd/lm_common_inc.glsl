@@ -68,6 +68,7 @@ triangle_indices;
 #define LIGHT_TYPE_OMNI 1
 #define LIGHT_TYPE_SPOT 2
 #define LIGHT_TYPE_AREA 3
+#define LIGHT_TYPE_LINE 4
 
 struct Light {
 	vec3 position;

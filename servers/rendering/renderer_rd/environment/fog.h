@@ -183,7 +183,7 @@ private:
 			float temporal_blend;
 
 			float sky_border_size[2];
-			float pad[2];
+			float shadow_atlas_pixel_size[2];
 
 			float cam_rotation[12];
 			float to_prev_view[16];
@@ -331,6 +331,10 @@ public:
 
 		int last_shadow_filter = -1;
 
+		// Line light inputs the process sets were built with; the pyramid is created lazily.
+		RID line_light_buffer;
+		RID line_shadow_pyramid;
+
 		// If the device doesn't support image atomics, use storage buffers instead.
 		RD::UniformType atomic_type = RD::UNIFORM_TYPE_IMAGE;
 
@@ -359,6 +363,9 @@ public:
 		RID spot_light_buffer;
 		RID area_light_buffer;
 		RID area_light_atlas;
+		RID line_light_buffer;
+		RID line_shadow_pyramid;
+		Vector2 shadow_atlas_pixel_size;
 		RID directional_shadow_depth;
 		RID directional_light_buffer;
 

@@ -795,7 +795,8 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 		RD::get_singleton()->compute_list_end();
 	}
 
-	bool gi_dependent_sets_valid = fog->sync_gi_dependent_sets_validity();
+	bool line_inputs_changed = fog->line_light_buffer != p_settings.line_light_buffer || fog->line_shadow_pyramid != p_settings.line_shadow_pyramid;
+	bool gi_dependent_sets_valid = fog->sync_gi_dependent_sets_validity(line_inputs_changed);
 	if (!fog->copy_uniform_set.is_null() && !RD::get_singleton()->uniform_set_is_valid(fog->copy_uniform_set)) {
 		fog->copy_uniform_set = RID();
 	}
@@ -1006,6 +1007,24 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 			copy_uniforms.push_back(u);
 		}
 
+		{
+			RD::Uniform u(RD::UNIFORM_TYPE_STORAGE_BUFFER, 22, p_settings.line_light_buffer);
+			uniforms.push_back(u);
+			copy_uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u(RD::UNIFORM_TYPE_TEXTURE, 23, p_settings.line_shadow_pyramid.is_valid() ? p_settings.line_shadow_pyramid : texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK));
+			uniforms.push_back(u);
+			copy_uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u(RD::UNIFORM_TYPE_SAMPLER, 24, material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED));
+			uniforms.push_back(u);
+			copy_uniforms.push_back(u);
+		}
+		fog->line_light_buffer = p_settings.line_light_buffer;
+		fog->line_shadow_pyramid = p_settings.line_shadow_pyramid;
+
 		if (fog->copy_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(fog->copy_uniform_set)) {
 			RD::get_singleton()->free_rid(fog->copy_uniform_set);
 		}
@@ -1134,6 +1153,8 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	params.filter_axis = 0;
 	params.max_voxel_gi_instances = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_gi_inject(p_settings.env) > 0.001 ? p_voxel_gi_count : 0;
 	params.temporal_frame = RSG::rasterizer->get_frame_number() % VolumetricFog::MAX_TEMPORAL_FRAMES;
+	params.shadow_atlas_pixel_size[0] = p_settings.shadow_atlas_pixel_size.x;
+	params.shadow_atlas_pixel_size[1] = p_settings.shadow_atlas_pixel_size.y;
 
 	Transform3D to_prev_cam_view = p_prev_cam_inv_transform * p_cam_transform;
 	RendererRD::MaterialStorage::store_transform(to_prev_cam_view, params.to_prev_view);

@@ -1824,6 +1824,18 @@ void GI::SDFGI::debug_probes(RID p_framebuffer, const uint32_t p_view_count, con
 	RD::get_singleton()->draw_list_end();
 }
 
+// `area_height`: minimum radius and energy normalization.
+void GI::SDFGI::_fill_line_light(SDFGIShader::Light &r_light, RID p_light, const Transform3D &p_transform, float p_y_mult) {
+	float length = RSG::light_storage->light_line_get_length(p_light);
+	Vector3 segment = p_transform.basis.get_column(0).normalized() * length;
+	segment.y *= p_y_mult;
+	r_light.area_width[0] = segment.x;
+	r_light.area_width[1] = segment.y;
+	r_light.area_width[2] = segment.z;
+	r_light.area_height[0] = RSG::light_storage->light_get_param(p_light, RSE::LIGHT_PARAM_SIZE);
+	r_light.area_height[1] = RSG::light_storage->light_area_get_normalize_energy(p_light) && length > 0.0 ? 1.0 / length : 1.0;
+}
+
 void GI::SDFGI::pre_process_gi(const Transform3D &p_transform, RenderDataRD *p_render_data) {
 	if (p_render_data->sdfgi_update_data == nullptr) {
 		return;
@@ -2004,7 +2016,7 @@ void GI::SDFGI::pre_process_gi(const Transform3D &p_transform, RenderDataRD *p_r
 				lights[idx].energy *= RSG::light_storage->light_get_param(light, RSE::LIGHT_PARAM_INTENSITY);
 
 				// Convert from Luminous Power to Luminous Intensity
-				if (lights[idx].type == RSE::LIGHT_OMNI) {
+				if (lights[idx].type == RSE::LIGHT_OMNI || lights[idx].type == RSE::LIGHT_LINE) {
 					lights[idx].energy *= 1.0 / (Math::PI * 4.0);
 				} else if (lights[idx].type == RSE::LIGHT_SPOT) {
 					// Spot Lights are not physically accurate, Luminous Intensity should change in relation to the cone angle.
@@ -2047,6 +2059,10 @@ void GI::SDFGI::pre_process_gi(const Transform3D &p_transform, RenderDataRD *p_r
 					float surface_area = area_size.x * area_size.y;
 					lights[idx].energy /= surface_area;
 				}
+			}
+
+			if (lights[idx].type == RSE::LIGHT_LINE) {
+				_fill_line_light(lights[idx], light, light_transform, y_mult);
 			}
 
 			idx++;
@@ -2495,7 +2511,7 @@ void GI::SDFGI::render_static_lights(RenderDataRD *p_render_data, Ref<RenderScen
 					lights[idx].energy *= RSG::light_storage->light_get_param(light, RSE::LIGHT_PARAM_INTENSITY);
 
 					// Convert from Luminous Power to Luminous Intensity
-					if (lights[idx].type == RSE::LIGHT_OMNI) {
+					if (lights[idx].type == RSE::LIGHT_OMNI || lights[idx].type == RSE::LIGHT_LINE) {
 						lights[idx].energy *= 1.0 / (Math::PI * 4.0);
 					} else if (lights[idx].type == RSE::LIGHT_SPOT) {
 						// Spot Lights are not physically accurate, Luminous Intensity should change in relation to the cone angle.
@@ -2538,6 +2554,10 @@ void GI::SDFGI::render_static_lights(RenderDataRD *p_render_data, Ref<RenderScen
 						float surface_area = area_size.x * area_size.y;
 						lights[idx].energy /= surface_area;
 					}
+				}
+
+				if (lights[idx].type == RSE::LIGHT_LINE) {
+					_fill_line_light(lights[idx], light, light_transform, y_mult);
 				}
 
 				idx++;
@@ -2998,7 +3018,7 @@ void GI::VoxelGIInstance::update(bool p_update_light_instances, const Vector<RID
 					l.energy *= gi->voxel_gi_get_baked_exposure_normalization(probe);
 
 					// Convert from Luminous Power to Luminous Intensity
-					if (l.type == RSE::LIGHT_OMNI) {
+					if (l.type == RSE::LIGHT_OMNI || l.type == RSE::LIGHT_LINE) {
 						l.energy *= 1.0 / (Math::PI * 4.0);
 					} else if (l.type == RSE::LIGHT_AREA) {
 						l.energy *= 1.0 / (Math::PI * 2.0);
@@ -3058,6 +3078,18 @@ void GI::VoxelGIInstance::update(bool p_update_light_instances, const Vector<RID
 						// normalization to make larger lights output same amount of light as smaller lights with same energy
 						float surface_area = area_size.x * area_size.y;
 						l.energy /= surface_area;
+					}
+				} else if (l.type == RSE::LIGHT_LINE) {
+					float length = RSG::light_storage->light_line_get_length(light);
+					Vector3 segment = to_probe_xform.basis.xform(xform.basis.get_column(0).normalized() * length);
+					l.area_width[0] = segment.x;
+					l.area_width[1] = segment.y;
+					l.area_width[2] = segment.z;
+					l.area_height[0] = RSG::light_storage->light_get_param(light, RSE::LIGHT_PARAM_SIZE); // Min radius, world units.
+					// World units per cell. The push constant's `cell_size` is off for non-cubic bounds.
+					l.area_height[1] = 1.0f / to_probe_xform.basis.get_column(0).length();
+					if (RSG::light_storage->light_area_get_normalize_energy(light) && length > 0.0) {
+						l.energy /= length;
 					}
 				}
 			}

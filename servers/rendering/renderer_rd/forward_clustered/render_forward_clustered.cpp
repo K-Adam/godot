@@ -1411,6 +1411,11 @@ void RenderForwardClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_
 		settings.spot_light_buffer = RendererRD::LightStorage::get_singleton()->get_spot_light_buffer();
 		settings.area_light_buffer = RendererRD::LightStorage::get_singleton()->get_area_light_buffer();
 		settings.area_light_atlas = RendererRD::TextureStorage::get_singleton()->area_light_atlas_get_texture();
+		settings.line_light_buffer = RendererRD::LightStorage::get_singleton()->get_line_light_buffer();
+		if (RendererRD::LightStorage::get_singleton()->owns_shadow_atlas(p_shadow_atlas)) {
+			settings.line_shadow_pyramid = RendererRD::LightStorage::get_singleton()->shadow_atlas_get_line_pyramid(p_shadow_atlas);
+			settings.shadow_atlas_pixel_size = Vector2(1.0, 1.0) / MAX(1, RendererRD::LightStorage::get_singleton()->shadow_atlas_get_size(p_shadow_atlas));
+		}
 		settings.directional_shadow_depth = RendererRD::LightStorage::get_singleton()->directional_shadow_get_texture();
 		settings.directional_light_buffer = RendererRD::LightStorage::get_singleton()->get_directional_light_buffer();
 
@@ -4269,6 +4274,10 @@ RID RenderForwardClustered::_setup_sdfgi_render_pass_uniform_set(RID p_albedo_te
 		u.append_id(instance_buffer);
 		uniforms.push_back(u);
 	}
+	// Line light shadow inputs, unused when voxelizing.
+	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 39, texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK)));
+	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 40, texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK)));
+	uniforms.push_back(RD::Uniform(RD::UNIFORM_TYPE_TEXTURE, 41, texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE)));
 
 	if (scene_shader.default_shader_sdfgi_rd.is_null()) {
 		// The variant for SDF from the default material should only be retrieved when SDFGI is required.

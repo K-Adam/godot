@@ -785,6 +785,8 @@ public:
 			Vector2 area_size;
 			bool area_normalize_energy;
 			RID area_texture;
+			float line_length;
+			float size;
 		};
 
 		Vector<LightCache> light_cache;

@@ -444,8 +444,64 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 	float soft_shadowing_disk_size;
 	vec3 light_texture_color = vec3(1.0);
 	vec3 shadow_dir;
+	// Line lights: the part of the segment above the horizon, from `line_start` over [t0, t1] of `line_segment`.
+	vec3 line_start;
+	vec3 line_segment;
+	vec2 line_t;
 	Light light_data = lights.data[p_light_index];
-	if (light_data.type == LIGHT_TYPE_DIRECTIONAL) {
+	if (light_data.type == LIGHT_TYPE_LINE) {
+		r_light_dir = vec3(0.0);
+		line_segment = light_data.area_width.xyz;
+		float length_sq = dot(line_segment, line_segment);
+		if (length_sq < 1e-12) {
+			return;
+		}
+		line_start = light_data.position - 0.5 * line_segment;
+		vec3 p1 = line_start - p_position;
+		vec3 closest_point = p1 + line_segment * clamp(dot(-p1, line_segment) / length_sq, 0.0, 1.0);
+		dist = max(length(closest_point), light_data.size);
+		if (dist > light_data.range) {
+			return;
+		}
+		// The integral already falls off with the inverse square of distance.
+		attenuation = get_omni_attenuation(dist, 1.0 / light_data.range, light_data.attenuation) * dist * dist;
+		attenuation *= M_PI * line_integrate_diffuse(p1, p1 + line_segment, p_normal, light_data.size);
+
+		float n1 = dot(p1, p_normal);
+		float n2 = dot(p1 + line_segment, p_normal);
+		line_t = vec2(n1 < 0.0 ? n1 / (n1 - n2) : 0.0, n2 < 0.0 ? n1 / (n1 - n2) : 1.0);
+		// Soft shadowing samples the segment itself. Other rays take one point following the
+		// integrand: sin(theta) is uniform with l = d tan(theta), the cosine by rejection.
+		light_pos = line_start + line_segment * mix(line_t.x, line_t.y, 0.5);
+		if (!p_soft_shadowing) {
+			vec3 wt = normalize(line_segment);
+			vec3 po = p1 - dot(p1, wt) * wt;
+			float d0 = length(po);
+			vec3 po_dir = d0 > 1e-6 ? po / d0 : normalize(cross(wt, abs(wt.x) < 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0)));
+			float d = max(d0, max(light_data.size, LINE_LIGHT_MIN_DISTANCE));
+			float la = dot(p1 + line_segment * line_t.x, wt);
+			float lb = dot(p1 + line_segment * line_t.y, wt);
+			float s1 = la / sqrt(d * d + la * la);
+			float s2 = lb / sqrt(d * d + lb * lb);
+			float a = dot(p_normal, po_dir);
+			float b = dot(p_normal, wt);
+			float bound = sqrt(a * a + b * b);
+			float l = 0.0;
+			for (int k = 0; k < 8; k++) {
+				float s = mix(s1, s2, randomize(r_noise));
+				float c = sqrt(max(1.0 - s * s, 1e-12));
+				l = clamp(d * s / c, la, lb); // Imprecise near the axis, where |s| is close to 1.
+				if (randomize(r_noise) * bound <= a * c + b * s) {
+					break;
+				}
+			}
+			light_pos = p_position + po + wt * l;
+		}
+		shadow_dir = normalize(light_pos - p_position);
+		// Towards the lit part, which the closest point may not be.
+		r_light_dir = shadow_dir;
+		soft_shadowing_disk_size = 0.0;
+	} else if (light_data.type == LIGHT_TYPE_DIRECTIONAL) {
 		vec3 light_vec = light_data.direction;
 		light_pos = p_position - light_vec * length(bake_params.world_size);
 		r_light_dir = normalize(light_pos - p_position);
@@ -529,7 +585,8 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 	float penumbra = 0.0;
 	vec3 penumbra_color = vec3(0.0);
 	if (p_soft_shadowing) {
-		const bool use_soft_shadows = (light_data.size > 0.0);
+		const bool is_line = light_data.type == LIGHT_TYPE_LINE;
+		const bool use_soft_shadows = (light_data.size > 0.0) || is_line;
 		const uint ray_count = AA_SAMPLES;
 		const uint total_ray_count = use_soft_shadows ? params.ray_count : ray_count;
 		const uint shadowing_rays_check_penumbra_denom = 2;
@@ -558,10 +615,11 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 
 			float power = 0.0;
 			vec3 light_color = vec3(0.0);
-			uint power_accm = 0;
+			float power_accm = 0.0;
 			vec3 prev_pos = origin;
 			if (use_soft_shadows) {
 				uint soft_shadow_hits = 0;
+				float line_u = is_line ? randomize(r_noise) : 0.0;
 				for (uint j = 0; j < shadowing_ray_count; j++) {
 					origin = prev_pos;
 					// Optimization:
@@ -583,6 +641,17 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 					float vogel_index = float(total_ray_count - 1 - (i * shadowing_ray_count + j)); // Start from (total_ray_count - 1) so we check the outer points first.
 					vec2 light_disk_sample = get_vogel_disk(vogel_index, a, shadowing_ray_count_sqrt) * soft_shadowing_disk_size * light_data.shadow_blur;
 					vec3 light_disk_to_point = normalize(light_to_point + light_disk_sample.x * light_to_point_tan + light_disk_sample.y * light_to_point_bitan);
+					float ray_dist = dist;
+					float sample_weight = 1.0;
+					if (is_line) {
+						// Golden-ratio order, so the early out has seen the whole lit part.
+						vec3 to_target = line_start + line_segment * mix(line_t.x, line_t.y, fract(line_u + float(j) * 0.618034)) - p_position;
+						ray_dist = length(to_target);
+						vec3 s = to_target / max(ray_dist, 1e-6);
+						light_disk_to_point = -s;
+						float min_distance = max(light_data.size, LINE_LIGHT_MIN_DISTANCE);
+						sample_weight = max(dot(p_normal, s), 0.0) * length(cross(s, normalize(line_segment))) / max(ray_dist * ray_dist, min_distance * min_distance);
+					}
 					float sample_penumbra = 0.0;
 					vec3 sample_penumbra_color = light_data.color.rgb * light_texture_color;
 					bool sample_did_hit = false;
@@ -591,7 +660,7 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 						vec4 hit_albedo = vec4(1.0);
 						vec3 hit_position;
 						// Offset the ray origin for AA, offset the light position for soft shadows.
-						uint ret = trace_ray_closest_hit_triangle_albedo_alpha(origin - light_disk_to_point * (bake_params.bias + length(disk_sample)), p_position - light_disk_to_point * dist, hit_albedo, hit_position);
+						uint ret = trace_ray_closest_hit_triangle_albedo_alpha(origin - light_disk_to_point * (bake_params.bias + length(disk_sample)), p_position - light_disk_to_point * ray_dist, hit_albedo, hit_position);
 						if (ret == RAY_MISS) {
 							if (!sample_did_hit) {
 								sample_penumbra = 1.0;
@@ -611,7 +680,7 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 								sample_penumbra_color = mix(sample_penumbra_color, sample_penumbra_color * hit_albedo.rgb, hit_albedo.a);
 								sample_penumbra *= 1.0 - hit_albedo.a;
 							}
-							origin = hit_position + shadow_dir * bake_params.bias;
+							origin = hit_position + (is_line ? -light_disk_to_point : shadow_dir) * bake_params.bias;
 
 							if (sample_penumbra - EPSILON <= 0) {
 								break;
@@ -619,9 +688,10 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 						}
 					}
 
-					power += sample_penumbra;
-					light_color += sample_penumbra_color;
-					power_accm++;
+					power += sample_weight * sample_penumbra;
+					// Only transmitted light may tint line lights, or occlusion counts twice.
+					light_color += sample_weight * (is_line ? sample_penumbra : 1.0) * sample_penumbra_color;
+					power_accm += sample_weight;
 				}
 
 			} else { // No soft shadows (size == 0).
@@ -658,10 +728,15 @@ void trace_direct_light(vec3 p_position, vec3 p_normal, uint p_light_index, bool
 				}
 				power = sample_penumbra;
 				light_color = sample_penumbra_color;
-				power_accm = 1;
+				power_accm = 1.0;
 			}
-			aa_power += power / float(power_accm);
-			penumbra_color += light_color / float(power_accm);
+			// Line light samples can all carry zero weight, e.g. on the segment's own axis.
+			aa_power += power_accm > 0.0 ? power / power_accm : 0.0;
+			if (is_line) {
+				penumbra_color += power > 0.0 ? light_color / power : light_data.color.rgb;
+			} else {
+				penumbra_color += light_color / float(power_accm);
+			}
 		}
 		penumbra = aa_power / ray_count;
 		penumbra_color /= ray_count;

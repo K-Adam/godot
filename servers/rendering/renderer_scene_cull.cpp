@@ -4067,7 +4067,9 @@ void RendererSceneCull::render_probes() {
 							cache->spot_attenuation != RSG::light_storage->light_get_param(instance->base, RSE::LIGHT_PARAM_SPOT_ATTENUATION) ||
 							cache->area_size != RSG::light_storage->light_area_get_size(instance->base) ||
 							cache->area_normalize_energy != RSG::light_storage->light_area_get_normalize_energy(instance->base) ||
-							cache->area_texture != RSG::light_storage->light_area_get_texture(instance->base)) {
+							cache->area_texture != RSG::light_storage->light_area_get_texture(instance->base) ||
+							cache->line_length != RSG::light_storage->light_line_get_length(instance->base) ||
+							cache->size != RSG::light_storage->light_get_param(instance->base, RSE::LIGHT_PARAM_SIZE)) {
 						cache_dirty = true;
 					}
 				}
@@ -4150,6 +4152,8 @@ void RendererSceneCull::render_probes() {
 					cache->area_size = RSG::light_storage->light_area_get_size(instance->base);
 					cache->area_normalize_energy = RSG::light_storage->light_area_get_normalize_energy(instance->base);
 					cache->area_texture = RSG::light_storage->light_area_get_texture(instance->base);
+					cache->line_length = RSG::light_storage->light_line_get_length(instance->base);
+					cache->size = RSG::light_storage->light_get_param(instance->base, RSE::LIGHT_PARAM_SIZE);
 					idx++;
 				}
 				for (const Instance *instance : probe->owner->scenario->directional_lights) {

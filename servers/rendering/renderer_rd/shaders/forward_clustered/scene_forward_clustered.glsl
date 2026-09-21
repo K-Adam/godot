@@ -3004,6 +3004,10 @@ void fragment_shader(in SceneData scene_data) {
 					continue; //not masked
 				}
 
+				if (line_lights.data[light_index].bake_mode == LIGHT_BAKE_STATIC && bool(instances.data[instance_index].flags & INSTANCE_FLAGS_USE_LIGHTMAP)) {
+					continue; // Statically baked light and object uses lightmap, skip
+				}
+
 				light_process_line(light_index, vertex, view, normal, f0, roughness, metallic, scene_data.taa_frame_count, albedo, alpha, screen_uv, energy_compensation,
 #ifdef LIGHT_BACKLIGHT_USED
 						backlight,

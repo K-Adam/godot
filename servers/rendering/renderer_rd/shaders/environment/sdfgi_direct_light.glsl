@@ -58,6 +58,10 @@ cascades;
 #define LIGHT_TYPE_OMNI 1
 #define LIGHT_TYPE_SPOT 2
 #define LIGHT_TYPE_AREA 3
+#define LIGHT_TYPE_LINE 4
+
+// Line lights are shadowed per sub-segment, one ray each.
+#define LINE_LIGHT_GI_SAMPLES 4
 
 #include "../area_lights_inc.glsl"
 
@@ -131,6 +135,12 @@ float get_omni_attenuation(float distance, float inv_range, float decay) {
 	return nd * pow(max(distance, 0.0001), -decay);
 }
 
+// SDFGI squashes Y by `y_mult`; lighting uses true distances, the ray march squashed ones.
+vec3 sdfgi_unsquash(vec3 v) {
+	return v * vec3(1.0, 1.0 / params.y_mult, 1.0);
+}
+
+// `light_vec` and `light_distance` are returned in SDF space, for the ray march.
 void compute_area_light(uint index, vec3 position, out float attenuation, out vec3 light_vec, out float light_distance, out vec3 texture_color) {
 	vec3 area_width = lights.data[index].area_width.xyz;
 	vec3 area_height = lights.data[index].area_height.xyz;
@@ -141,22 +151,25 @@ void compute_area_light(uint index, vec3 position, out float attenuation, out ve
 	vec3 area_height_norm = normalize(area_height);
 	float a_half_len = a_len / 2.0;
 	float b_half_len = b_len / 2.0;
-	vec3 light_center = lights.data[index].position;
+	vec3 light_center = sdfgi_unsquash(lights.data[index].position);
+	position = sdfgi_unsquash(position);
 	vec3 light_to_vert = position - light_center;
 	vec3 pos_local_to_light = vec3(dot(light_to_vert, area_width_norm), dot(light_to_vert, area_height_norm), dot(light_to_vert, -area_direction)); // position in LIGHT SPACE
 	vec3 closest_point_local_to_light = vec3(clamp(pos_local_to_light.x, -a_half_len, a_half_len), clamp(pos_local_to_light.y, -b_half_len, b_half_len), 0.0); // LIGHT SPACE
 	float inv_center_range = lights.data[index].inv_spot_attenuation;
 	vec3 closest_point_on_light = light_center + closest_point_local_to_light.x * area_width_norm + closest_point_local_to_light.y * area_height_norm; // VIEW SPACE
 	vec3 light_rel_vec = closest_point_on_light - position;
-	light_distance = length(light_rel_vec);
-	light_vec = light_rel_vec / light_distance;
+	float true_distance = length(light_rel_vec);
+	vec3 march_vec = light_rel_vec * vec3(1.0, params.y_mult, 1.0);
+	light_distance = length(march_vec);
+	light_vec = march_vec / light_distance;
 	float EPSILON = 1e-4f;
 	if (light_distance < EPSILON) {
 		light_vec = area_direction;
 	}
 	float max_mipmap = lights.data[index].cos_spot_angle;
 
-	if (light_distance * inv_center_range >= 1.0) { // position in range
+	if (true_distance * inv_center_range >= 1.0) { // position in range
 		attenuation = 0.0;
 		return;
 	}
@@ -164,16 +177,82 @@ void compute_area_light(uint index, vec3 position, out float attenuation, out ve
 	vec3 h_area_width = area_width / 2.0;
 	vec3 h_area_height = area_height / 2.0;
 	vec3 light_points[4];
-	light_points[0] = lights.data[index].position - h_area_width - h_area_height - position;
-	light_points[1] = lights.data[index].position + h_area_width - h_area_height - position;
-	light_points[2] = lights.data[index].position + h_area_width + h_area_height - position;
-	light_points[3] = lights.data[index].position - h_area_width + h_area_height - position;
+	light_points[0] = light_center - h_area_width - h_area_height - position;
+	light_points[1] = light_center + h_area_width - h_area_height - position;
+	light_points[2] = light_center + h_area_width + h_area_height - position;
+	light_points[3] = light_center - h_area_width + h_area_height - position;
 
-	attenuation = get_omni_attenuation(light_distance, 1.0 / lights.data[index].radius, lights.data[index].attenuation - 2.0);
+	attenuation = get_omni_attenuation(true_distance, 1.0 / lights.data[index].radius, lights.data[index].attenuation - 2.0);
 	float ltc_diffuse = 0.0;
-	vec3 normal = light_vec;
+	vec3 normal = true_distance < EPSILON ? area_direction : light_rel_vec / true_distance;
 	ltc_evaluate_diff(normal, light_points, lights.data[index].area_projector_rect, max_mipmap, area_light_atlas, linear_sampler_with_mipmaps, ltc_diffuse, texture_color);
 	attenuation *= ltc_diffuse;
+}
+
+// Marches the SDF cascades from `position` towards the light; false on a hit.
+bool sdf_light_visible(vec3 position, vec3 direction, float light_distance) {
+	vec3 pos_to_uvw = 1.0 / params.grid_size;
+	bool hit = false;
+
+	vec3 ray_pos = position;
+	vec3 ray_dir = direction;
+	vec3 inv_dir = 1.0 / ray_dir;
+
+	//this is how to properly bias outgoing rays
+	float cell_size = 1.0 / cascades.data[params.cascade].to_cell;
+	ray_pos += sign(direction) * cell_size * 0.48; // go almost to the box edge but remain inside
+	ray_pos += ray_dir * 0.4 * cell_size; //apply a small bias from there
+
+	for (uint j = params.cascade; j < params.max_cascades; j++) {
+		//convert to local bounds
+		vec3 pos = ray_pos - cascades.data[j].offset;
+		pos *= cascades.data[j].to_cell;
+		float local_distance = light_distance * cascades.data[j].to_cell;
+
+		if (any(lessThan(pos, vec3(0.0))) || any(greaterThanEqual(pos, params.grid_size))) {
+			continue; //already past bounds for this cascade, goto next
+		}
+
+		//find maximum advance distance (until reaching bounds)
+		vec3 t0 = -pos * inv_dir;
+		vec3 t1 = (params.grid_size - pos) * inv_dir;
+		vec3 tmax = max(t0, t1);
+		float max_advance = min(tmax.x, min(tmax.y, tmax.z));
+
+		max_advance = min(local_distance, max_advance);
+
+		float advance = 0.0;
+
+		while (advance < max_advance) {
+			//read how much to advance from SDF
+			vec3 uvw = (pos + ray_dir * advance) * pos_to_uvw;
+
+			float distance = texture(sampler3D(sdf_cascades[j], linear_sampler), uvw).r * 255.0 - 1.0;
+			if (distance < 0.001) {
+				//consider hit
+				hit = true;
+				break;
+			}
+
+			advance += distance;
+		}
+
+		if (hit) {
+			break;
+		}
+
+		if (advance >= local_distance) {
+			break; //past light distance, abandon search
+		}
+		//change ray origin to collision with bounds
+		pos += ray_dir * max_advance;
+		pos /= cascades.data[j].to_cell;
+		pos += cascades.data[j].offset;
+		light_distance -= max_advance / cascades.data[j].to_cell;
+		ray_pos = pos;
+	}
+
+	return !hit;
 }
 
 void main() {
@@ -312,9 +391,6 @@ void main() {
 
 	// Raytrace light
 
-	vec3 pos_to_uvw = 1.0 / params.grid_size;
-	vec3 uvw_ofs = pos_to_uvw * 0.5;
-
 	for (uint i = 0; i < params.light_count; i++) {
 		float attenuation = 1.0;
 		vec3 direction;
@@ -329,19 +405,18 @@ void main() {
 				vec3 rel_vec = lights.data[i].position - position;
 				direction = normalize(rel_vec);
 				light_distance = length(rel_vec);
-				rel_vec.y /= params.y_mult;
-				attenuation = get_omni_attenuation(light_distance, 1.0 / lights.data[i].radius, lights.data[i].attenuation);
+				attenuation = get_omni_attenuation(length(sdfgi_unsquash(rel_vec)), 1.0 / lights.data[i].radius, lights.data[i].attenuation);
 
 			} break;
 			case LIGHT_TYPE_SPOT: {
 				vec3 rel_vec = lights.data[i].position - position;
 				direction = normalize(rel_vec);
 				light_distance = length(rel_vec);
-				rel_vec.y /= params.y_mult;
-				attenuation = get_omni_attenuation(light_distance, 1.0 / lights.data[i].radius, lights.data[i].attenuation);
+				vec3 true_vec = sdfgi_unsquash(rel_vec);
+				attenuation = get_omni_attenuation(length(true_vec), 1.0 / lights.data[i].radius, lights.data[i].attenuation);
 
 				float cos_spot_angle = lights.data[i].cos_spot_angle;
-				float cos_angle = dot(-direction, lights.data[i].direction);
+				float cos_angle = dot(-normalize(true_vec), lights.data[i].direction);
 
 				if (cos_angle < cos_spot_angle) {
 					continue;
@@ -358,82 +433,65 @@ void main() {
 				if (dot(area_width, area_width) < EPSILON || dot(area_height, area_height) < EPSILON) {
 					continue; // area is 0
 				}
-				if (dot(lights.data[i].direction, position - lights.data[i].position) <= 0) {
+				if (dot(lights.data[i].direction, sdfgi_unsquash(position - lights.data[i].position)) <= 0) {
 					continue; // position is behind light
 				}
 				compute_area_light(i, position, attenuation, direction, light_distance, texture_color);
 			} break;
+			case LIGHT_TYPE_LINE: {
+				// One ray per sub-segment, to its middle. `area_width` is squashed like `position`.
+				vec3 segment = lights.data[i].area_width.xyz;
+				float min_radius = lights.data[i].area_height.x;
+				vec3 p1 = lights.data[i].position - 0.5 * segment - position;
+				vec3 segment_true = sdfgi_unsquash(segment);
+				vec3 p1_true = sdfgi_unsquash(p1);
+				float length_sq = dot(segment_true, segment_true);
+				if (length_sq < 1e-12) {
+					continue;
+				}
+				float dist = max(length(p1_true + segment_true * clamp(dot(-p1_true, segment_true) / length_sq, 0.0, 1.0)), min_radius);
+				if (dist >= lights.data[i].radius) {
+					continue;
+				}
+				// The integral already falls off with the inverse square of distance.
+				float scale = M_PI * lights.data[i].area_height.y * get_omni_attenuation(dist, 1.0 / lights.data[i].radius, lights.data[i].attenuation) * dist * dist;
+
+				vec3 sub = segment / float(LINE_LIGHT_GI_SAMPLES);
+				float sub_attenuation[LINE_LIGHT_GI_SAMPLES];
+				float total = 0.0;
+				for (int k = 0; k < LINE_LIGHT_GI_SAMPLES; k++) {
+					vec3 a = p1 + sub * float(k);
+					vec3 mid = sdfgi_unsquash(a + 0.5 * sub);
+					// Voxels have no normal: light them as if they faced the sub-segment.
+					sub_attenuation[k] = dot(mid, mid) > 1e-12 ? scale * line_integrate_diffuse(sdfgi_unsquash(a), sdfgi_unsquash(a + sub), normalize(mid), min_radius) : 0.0;
+					total += sub_attenuation[k];
+				}
+				if (total < 0.001) {
+					continue;
+				}
+
+				for (int k = 0; k < LINE_LIGHT_GI_SAMPLES; k++) {
+					vec3 mid = p1 + sub * (float(k) + 0.5);
+					float mid_distance = length(mid);
+					if (sub_attenuation[k] <= 0.0 || !sdf_light_visible(position, mid / mid_distance, mid_distance)) {
+						continue;
+					}
+					vec3 light = albedo * lights.data[i].color.rgb * lights.data[i].energy * sub_attenuation[k];
+					for (int j = 0; j < 6; j++) {
+						if (bool(valid_aniso & (1 << j))) {
+							light_accum[j] += max(0.0, dot(aniso_dir[j], mid / mid_distance)) * light;
+						}
+					}
+				}
+				continue;
+			}
 		}
 
 		if (attenuation < 0.001) {
 			continue;
 		}
 
-		bool hit = false;
-
-		vec3 ray_pos = position;
-		vec3 ray_dir = direction;
-		vec3 inv_dir = 1.0 / ray_dir;
-
-		//this is how to properly bias outgoing rays
-		float cell_size = 1.0 / cascades.data[params.cascade].to_cell;
-		ray_pos += sign(direction) * cell_size * 0.48; // go almost to the box edge but remain inside
-		ray_pos += ray_dir * 0.4 * cell_size; //apply a small bias from there
-
-		for (uint j = params.cascade; j < params.max_cascades; j++) {
-			//convert to local bounds
-			vec3 pos = ray_pos - cascades.data[j].offset;
-			pos *= cascades.data[j].to_cell;
-			float local_distance = light_distance * cascades.data[j].to_cell;
-
-			if (any(lessThan(pos, vec3(0.0))) || any(greaterThanEqual(pos, params.grid_size))) {
-				continue; //already past bounds for this cascade, goto next
-			}
-
-			//find maximum advance distance (until reaching bounds)
-			vec3 t0 = -pos * inv_dir;
-			vec3 t1 = (params.grid_size - pos) * inv_dir;
-			vec3 tmax = max(t0, t1);
-			float max_advance = min(tmax.x, min(tmax.y, tmax.z));
-
-			max_advance = min(local_distance, max_advance);
-
-			float advance = 0.0;
-			float occlusion = 1.0;
-
-			while (advance < max_advance) {
-				//read how much to advance from SDF
-				vec3 uvw = (pos + ray_dir * advance) * pos_to_uvw;
-
-				float distance = texture(sampler3D(sdf_cascades[j], linear_sampler), uvw).r * 255.0 - 1.0;
-				if (distance < 0.001) {
-					//consider hit
-					hit = true;
-					break;
-				}
-
-				occlusion = min(occlusion, distance);
-
-				advance += distance;
-			}
-
-			if (hit) {
-				attenuation *= occlusion;
-				break;
-			}
-
-			if (advance >= local_distance) {
-				break; //past light distance, abandon search
-			}
-			//change ray origin to collision with bounds
-			pos += ray_dir * max_advance;
-			pos /= cascades.data[j].to_cell;
-			pos += cascades.data[j].offset;
-			light_distance -= max_advance / cascades.data[j].to_cell;
-			ray_pos = pos;
-		}
-
-		if (!hit) {
+		if (sdf_light_visible(position, direction, light_distance)) {
 			vec3 light = albedo * lights.data[i].color.rgb * texture_color * lights.data[i].energy * attenuation;
 
 			for (int j = 0; j < 6; j++) {

@@ -214,12 +214,6 @@ RID LightStorage::line_light_allocate() {
 
 void LightStorage::line_light_initialize(RID p_rid) {
 	_light_initialize(p_rid, RSE::LIGHT_LINE);
-
-	// Line lights support neither shadows nor baked GI yet, so keep them out of
-	// every baker and shadow path from the start (the struct default is DYNAMIC).
-	Light *light = light_owner.get_or_null(p_rid);
-	ERR_FAIL_NULL(light);
-	light->bake_mode = RSE::LIGHT_BAKE_DISABLED;
 }
 
 void LightStorage::light_free(RID p_rid) {
@@ -372,9 +366,7 @@ void LightStorage::light_set_bake_mode(RID p_light, RSE::LightBakeMode p_bake_mo
 	Light *light = light_owner.get_or_null(p_light);
 	ERR_FAIL_NULL(light);
 
-	// Line lights are not supported by any GI baker yet; keeping them disabled
-	// means SDFGI, VoxelGI and LightmapGI all skip them without extra checks.
-	light->bake_mode = light->type == RSE::LIGHT_LINE ? RSE::LIGHT_BAKE_DISABLED : p_bake_mode;
+	light->bake_mode = p_bake_mode;
 
 	light->version++;
 	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);

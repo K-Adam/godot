@@ -190,6 +190,33 @@ void LightmapperRD::add_area_light(const String &p_name, bool p_static, const Ve
 	light_metadata.push_back(md);
 }
 
+void LightmapperRD::add_line_light(const String &p_name, bool p_static, const Vector3 &p_position, const Vector3 &p_segment, const Color &p_color, float p_energy, float p_indirect_energy, float p_range, float p_attenuation, float p_min_radius) {
+	Light l;
+	l.type = LIGHT_TYPE_LINE;
+	l.position[0] = p_position.x;
+	l.position[1] = p_position.y;
+	l.position[2] = p_position.z;
+	l.area_width[0] = p_segment.x;
+	l.area_width[1] = p_segment.y;
+	l.area_width[2] = p_segment.z;
+	l.range = p_range;
+	l.attenuation = p_attenuation;
+	l.color[0] = p_color.r;
+	l.color[1] = p_color.g;
+	l.color[2] = p_color.b;
+	l.energy = p_energy;
+	l.indirect_energy = p_indirect_energy;
+	l.static_bake = p_static;
+	l.size = p_min_radius;
+	l.shadow_blur = 1.0;
+	lights.push_back(l);
+
+	LightMetadata md;
+	md.name = p_name;
+	md.type = LIGHT_TYPE_LINE;
+	light_metadata.push_back(md);
+}
+
 void LightmapperRD::add_area_light_atlas(const Vector2i &p_size, int p_mipmap_count, const PackedByteArray &p_atlas_data) {
 	area_light_atlas.mipmap_count = p_mipmap_count;
 	area_light_atlas.size = p_size;

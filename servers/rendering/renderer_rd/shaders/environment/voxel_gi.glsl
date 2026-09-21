@@ -41,6 +41,10 @@ cell_data;
 #define LIGHT_TYPE_OMNI 1
 #define LIGHT_TYPE_SPOT 2
 #define LIGHT_TYPE_AREA 3
+#define LIGHT_TYPE_LINE 4
+
+// Line lights are shadowed per sub-segment, one ray each.
+#define LINE_LIGHT_GI_SAMPLES 4
 
 #include "../area_lights_inc.glsl"
 
@@ -281,6 +285,33 @@ void clip_segment(vec4 plane, vec3 begin, inout vec3 end) {
 	end = begin + segment * -dist;
 }
 
+// Visibility of `light_pos` from `pos`, marching from the light; 0.0 when blocked.
+float light_occlusion(vec3 pos, vec3 normal, vec3 light_pos, vec3 light_dir) {
+	float distance_adv = get_normal_advance(light_dir);
+
+	vec3 to = pos;
+	if (length(normal) > 0.2) {
+		to += normal * distance_adv * 0.51;
+	} else {
+		to -= sign(light_dir) * 0.45; //go near the edge towards the light direction to avoid self occlusion
+	}
+
+	//clip
+	clip_segment(mix(vec4(-1.0, 0.0, 0.0, 0.0), vec4(1.0, 0.0, 0.0, float(params.limits.x - 1)), bvec4(light_dir.x < 0.0)), to, light_pos);
+	clip_segment(mix(vec4(0.0, -1.0, 0.0, 0.0), vec4(0.0, 1.0, 0.0, float(params.limits.y - 1)), bvec4(light_dir.y < 0.0)), to, light_pos);
+	clip_segment(mix(vec4(0.0, 0.0, -1.0, 0.0), vec4(0.0, 0.0, 1.0, float(params.limits.z - 1)), bvec4(light_dir.z < 0.0)), to, light_pos);
+
+	float distance = length(to - light_pos);
+	if (distance < 0.1) {
+		return 0.0; // hit
+	}
+
+	distance += distance_adv - mod(distance, distance_adv); //make it reach the center of the box always
+	light_pos = to - light_dir * distance;
+
+	return raymarch(distance, distance_adv, light_pos, light_dir);
+}
+
 bool compute_light_at_pos(uint index, vec3 pos, vec3 normal, inout vec3 light, inout vec3 light_dir) {
 	float attenuation;
 	vec3 light_pos;
@@ -295,49 +326,60 @@ bool compute_light_at_pos(uint index, vec3 pos, vec3 normal, inout vec3 light, i
 	}
 
 	if (lights.data[index].has_shadow) {
-		float distance_adv = get_normal_advance(light_dir);
-
-		vec3 to = pos;
-		if (length(normal) > 0.2) {
-			to += normal * distance_adv * 0.51;
-		} else {
-			to -= sign(light_dir) * 0.45; //go near the edge towards the light direction to avoid self occlusion
-		}
-
-		//clip
-		clip_segment(mix(vec4(-1.0, 0.0, 0.0, 0.0), vec4(1.0, 0.0, 0.0, float(params.limits.x - 1)), bvec4(light_dir.x < 0.0)), to, light_pos);
-		clip_segment(mix(vec4(0.0, -1.0, 0.0, 0.0), vec4(0.0, 1.0, 0.0, float(params.limits.y - 1)), bvec4(light_dir.y < 0.0)), to, light_pos);
-		clip_segment(mix(vec4(0.0, 0.0, -1.0, 0.0), vec4(0.0, 0.0, 1.0, float(params.limits.z - 1)), bvec4(light_dir.z < 0.0)), to, light_pos);
-
-		float distance = length(to - light_pos);
-		if (distance < 0.1) {
-			return false; // hit
-		}
-
-		distance += distance_adv - mod(distance, distance_adv); //make it reach the center of the box always
-		light_pos = to - light_dir * distance;
-
-		//from -= sign(light_dir)*0.45; //go near the edge towards the light direction to avoid self occlusion
-
-		/*float dist = raymarch(distance,distance_adv,light_pos,light_dir);
-
-		if (dist > distance_adv) {
-			return false;
-		}
-
-		attenuation *= 1.0 - smoothstep(0.1*distance_adv,distance_adv,dist);
-		*/
-
-		float occlusion = raymarch(distance, distance_adv, light_pos, light_dir);
+		float occlusion = light_occlusion(pos, normal, light_pos, light_dir);
 
 		if (occlusion == 0.0) {
 			return false;
 		}
 
-		attenuation *= occlusion; //1.0 - smoothstep(0.1*distance_adv,distance_adv,dist);
+		attenuation *= occlusion;
 	}
 
 	light = lights.data[index].color * attenuation * lights.data[index].energy;
+	return true;
+}
+
+// As light_process_line(), with each sub-segment's share of the integral shadowed by one ray.
+bool compute_line_light(uint index, vec3 pos, vec3 normal, inout vec3 light) {
+	vec3 segment = lights.data[index].area_width.xyz;
+	float length_sq = dot(segment, segment);
+	if (length_sq < 1e-12) {
+		return false;
+	}
+
+	vec3 p1 = lights.data[index].position - 0.5 * segment - pos;
+	vec3 closest_point = p1 + segment * clamp(dot(-p1, segment) / length_sq, 0.0, 1.0);
+	float min_radius = lights.data[index].area_height.x;
+	float cell_size = lights.data[index].area_height.y;
+	float dist = max(length(closest_point) * cell_size, min_radius);
+	float radius = lights.data[index].radius * cell_size;
+	if (dist >= radius) {
+		return false;
+	}
+	// The integral already falls off with the inverse square of distance.
+	float window = get_omni_attenuation(dist, 1.0 / radius, lights.data[index].attenuation) * dist * dist;
+	if (window < 0.01) {
+		return false;
+	}
+
+	// Without a normal, light the cell as if it faced the segment.
+	vec3 n = dot(normal, normal) < 0.04 ? closest_point / max(length(closest_point), 1e-6) : normal;
+	vec3 sub = segment / float(LINE_LIGHT_GI_SAMPLES);
+	float integral = 0.0;
+	for (int k = 0; k < LINE_LIGHT_GI_SAMPLES; k++) {
+		vec3 a = p1 + sub * float(k);
+		float e = line_integrate_diffuse(a * cell_size, (a + sub) * cell_size, n, min_radius);
+		vec3 mid = a + 0.5 * sub;
+		if (e > 0.0 && lights.data[index].has_shadow && dot(mid, mid) > 1e-8) {
+			e *= light_occlusion(pos, normal, pos + mid, -normalize(mid));
+		}
+		integral += e;
+	}
+	if (integral <= 0.0) {
+		return false;
+	}
+
+	light = lights.data[index].color * lights.data[index].energy * (M_PI * integral * window);
 	return true;
 }
 
@@ -430,7 +472,12 @@ void main() {
 	vec3 accum = vec3(0.0);
 
 	for (uint i = 0; i < params.light_count; i++) {
-		if (lights.data[i].type != LIGHT_TYPE_AREA) {
+		if (lights.data[i].type == LIGHT_TYPE_LINE) {
+			vec3 light;
+			if (compute_line_light(i, pos, normal, light)) {
+				accum += light * albedo.rgb;
+			}
+		} else if (lights.data[i].type != LIGHT_TYPE_AREA) {
 			vec3 light;
 			vec3 light_dir;
 			if (!compute_light_at_pos(i, pos, normal, light, light_dir)) {
@@ -584,7 +631,12 @@ void main() {
 
 		vec3 accum = vec3(0.0);
 		for (uint i = 0; i < params.light_count; i++) {
-			if (lights.data[i].type != LIGHT_TYPE_AREA) {
+			if (lights.data[i].type == LIGHT_TYPE_LINE) {
+				vec3 light;
+				if (compute_line_light(i, vec3(pos) * params.pos_multiplier, normal, light)) {
+					accum += light * albedo.rgb;
+				}
+			} else if (lights.data[i].type != LIGHT_TYPE_AREA) {
 				vec3 light;
 				vec3 light_dir;
 				if (!compute_light_at_pos(i, vec3(pos) * params.pos_multiplier, normal, light, light_dir)) {

@@ -8,6 +8,8 @@
 #pragma use_vulkan_memory_model
 #endif
 
+#extension GL_EXT_control_flow_attributes : require
+
 #ifdef MODE_DENSITY
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 #else
@@ -16,6 +18,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 #include "../area_lights_inc.glsl"
 #include "../cluster_data_inc.glsl"
+#include "../half_inc.glsl"
 #include "../light_data_inc.glsl"
 #include "../oct_inc.glsl"
 
@@ -185,7 +188,7 @@ layout(set = 0, binding = 15, std140) uniform Params {
 	float temporal_blend;
 
 	vec2 sky_border_size;
-	vec2 pad;
+	vec2 shadow_atlas_pixel_size;
 
 	mat3x4 cam_rotation;
 	mat4 to_prev_view;
@@ -220,6 +223,16 @@ layout(set = 0, binding = 20) uniform texture2D sky_texture;
 #endif // MODE_COPY
 
 layout(set = 0, binding = 21) uniform texture2D area_light_atlas;
+
+layout(set = 0, binding = 22, std430) restrict readonly buffer LineLights {
+	LightData data[];
+}
+line_lights;
+
+layout(set = 0, binding = 23) uniform texture2D line_shadow_pyramid;
+layout(set = 0, binding = 24) uniform sampler SAMPLER_NEAREST_CLAMP;
+
+#include "../line_light_shadow_inc.glsl"
 
 float get_depth_at_pos(float cell_depth_size, int z) {
 	float d = float(z) * cell_depth_size + cell_depth_size * 0.5; //center of voxels
@@ -695,6 +708,61 @@ void main() {
 							total_light += light_color * attenuation * shadow_attenuation * henyey_greenstein(cos_theta, params.phase_g) * area_lights.data[light_index].volumetric_fog_energy;
 						}
 					}
+				}
+			}
+		}
+
+		{ //line lights
+
+			uint cluster_line_offset = cluster_offset + params.cluster_type_size * 5;
+
+			uint item_min;
+			uint item_max;
+			uint item_from;
+			uint item_to;
+
+			cluster_get_item_range(cluster_line_offset + params.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
+
+			for (uint i = item_from; i < item_to; i++) {
+				uint mask = cluster_buffer.data[cluster_line_offset + i];
+				mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+				uint merged_mask = mask;
+
+				while (merged_mask != 0) {
+					uint bit = findMSB(merged_mask);
+					merged_mask &= ~(1 << bit);
+
+					uint light_index = 32 * i + bit;
+
+					vec3 segment = line_lights.data[light_index].area_width;
+					float length_sq = dot(segment, segment);
+					if (line_lights.data[light_index].volumetric_fog_energy <= 0.001 || length_sq < 1e-12) {
+						continue;
+					}
+					vec3 p1 = line_lights.data[light_index].position - 0.5 * segment - view_pos;
+					vec3 closest_point = p1 + segment * clamp(dot(-p1, segment) / length_sq, 0.0, 1.0);
+					float min_radius = max(line_lights.data[light_index].size, 0.0);
+					float d = max(length(closest_point), min_radius);
+					if (d * line_lights.data[light_index].inv_radius >= 1.0) {
+						continue;
+					}
+					// line_measure() already falls off as 1/d^2; fog has no surface cosine.
+					float attenuation = get_omni_attenuation(d, line_lights.data[light_index].inv_radius, line_lights.data[light_index].attenuation) * d * d;
+					attenuation *= line_measure(p1, p1 + segment, min_radius);
+					vec3 light_vec = safe_normalize(closest_point);
+
+					float shadow_attenuation = 1.0;
+					if (line_lights.data[light_index].shadow_opacity > 0.001 && dot(light_vec, light_vec) > 0.0) {
+						// Facing the closest point keeps the segment above the horizon; each cell is 1/64
+						// of line_measure(). The noise only moves when reprojection averages it.
+						LineShadowContext ctx = line_shadow_begin(light_index, view_pos, light_vec, params.use_temporal_reprojection ? float(params.temporal_frame) : 0.0, vec2(pos.xy) + float(pos.z) * vec2(17.0, 31.0), params.shadow_atlas_pixel_size);
+						LineShadowCells cells = line_shadow_cells(ctx.receiver.z, max(length(ctx.receiver.xy), LINE_LIGHT_MIN_DISTANCE), 0.5 * sqrt(length_sq), ctx.jitter);
+						uvec2 hidden;
+						uvec2 unused;
+						line_shadow_mask(ctx, cells, cells, true, false, hidden, unused);
+						shadow_attenuation = 1.0 - line_lights.data[light_index].shadow_opacity * float(bitCount(hidden.x) + bitCount(hidden.y)) / 64.0;
+					}
+					total_light += line_lights.data[light_index].color * attenuation * shadow_attenuation * henyey_greenstein(dot(light_vec, safe_normalize(view_pos)), params.phase_g) * line_lights.data[light_index].volumetric_fog_energy;
 				}
 			}
 		}

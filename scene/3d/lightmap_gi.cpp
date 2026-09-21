@@ -1417,6 +1417,16 @@ LightmapGI::BakeError LightmapGI::bake(Node *p_from_node, String p_image_data_pa
 					tex = area_light_atlas_textures[l->get_area_texture()];
 				}
 				lightmapper->add_area_light(light->get_name(), light->get_bake_mode() == Light3D::BAKE_STATIC, xf.origin, -xf.basis.get_column(Vector3::AXIS_Z).normalized(), linear_color, energy, indirect_energy, l->get_param(Light3D::PARAM_RANGE), l->get_param(Light3D::PARAM_ATTENUATION), area_vec_x, area_vec_y, l->get_param(Light3D::PARAM_SIZE), l->get_param(Light3D::PARAM_SHADOW_BLUR), tex.texture_rect, tex.max_mipmap);
+			} else if (Object::cast_to<LineLight3D>(light)) {
+				LineLight3D *l = Object::cast_to<LineLight3D>(light);
+				if (use_physical_light_units) {
+					energy *= (1.0 / (Math::PI * 4.0));
+				}
+				if (l->is_line_normalizing_energy() && l->get_line_length() > 0.0) {
+					energy /= l->get_line_length();
+				}
+				Vector3 segment = xf.basis.get_column(Vector3::AXIS_X).normalized() * l->get_line_length();
+				lightmapper->add_line_light(light->get_name(), light->get_bake_mode() == Light3D::BAKE_STATIC, xf.origin, segment, linear_color, energy, indirect_energy, l->get_param(Light3D::PARAM_RANGE), l->get_param(Light3D::PARAM_ATTENUATION), l->get_param(Light3D::PARAM_SIZE));
 			}
 		}
 		for (int i = 0; i < probes_found.size(); i++) {
