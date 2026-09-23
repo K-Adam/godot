@@ -1808,6 +1808,27 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 				params.ltc_lut1 = rd_texture_storage->texture_get_rd_texture(ltc.lut1_texture);
 				params.ltc_lut2 = rd_texture_storage->texture_get_rd_texture(ltc.lut2_texture);
 				params.filter_passes = GLOBAL_GET_CACHED(int, "rendering/lights_and_shadows/positional_shadow/line_light_shadow_filter");
+
+				// Temporal reuse, by camera motion alone: the pass runs before motion vectors exist.
+				params.temporal_frames = GLOBAL_GET_CACHED(int, "rendering/lights_and_shadows/positional_shadow/line_light_shadow_temporal_frames");
+				static_assert(RendererRD::SSEffects::LINE_SHADOW_HISTORY_MAX == RendererRD::LightStorage::LINE_SCREEN_SHADOWS_MAX);
+				uint64_t keys[RendererRD::LightStorage::LINE_SCREEN_SHADOWS_MAX];
+				uint64_t versions[RendererRD::LightStorage::LINE_SCREEN_SHADOWS_MAX];
+				const RendererRD::LightStorage::LineScreenShadowState *states = light_storage->get_line_screen_shadow_states();
+				for (uint32_t i = 0; i < params.light_count; i++) {
+					keys[i] = states[i].key;
+					versions[i] = states[i].version;
+				}
+				params.light_keys = keys;
+				params.light_versions = versions;
+				const RenderSceneDataRD *scene_data = p_render_data->scene_data;
+				// Without last frame's jitter: the shader adds this frame's, so a still camera
+				// reads each pixel's history back from the same pixel.
+				Projection prev_correction;
+				prev_correction.set_depth_correction(scene_data->flip_y);
+				const Transform3D to_prev_view = scene_data->prev_cam_transform.affine_inverse() * scene_data->cam_transform;
+				params.reprojection = prev_correction * scene_data->prev_cam_projection * Projection(to_prev_view);
+				params.prev_view_z = Vector4(to_prev_view.basis.rows[2].x, to_prev_view.basis.rows[2].y, to_prev_view.basis.rows[2].z, to_prev_view.origin.z);
 				ss_effects->line_light_shadows(rb, params);
 			}
 		}
@@ -2362,6 +2383,10 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		base_specialization.cluster_has_area_light = current_cluster_builder->get_cluster_count_by_type(ClusterBuilderRD::ELEMENT_TYPE_AREA_LIGHT) != 0;
 		base_specialization.cluster_has_line_light = current_cluster_builder->get_cluster_count_by_type(ClusterBuilderRD::ELEMENT_TYPE_LINE_LIGHT) != 0;
 	}
+	// Without MSAA, opaque fragments are the prepass's surface, so they read the pass
+	// instead of walking; transparents still walk.
+	base_specialization.line_shadow_pass_only = line_shadow_pass_used && !is_reflection_probe && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_UNSHADED &&
+			!use_msaa && !RendererRD::LightStorage::get_singleton()->line_screen_shadows_overflowed();
 
 	RENDER_TIMESTAMP("Render Opaque Pass");
 
@@ -2590,6 +2615,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	RD::get_singleton()->draw_command_begin_label("Render 3D Transparent Pass");
 
 	uint32_t transparent_pass_uniform_buffer_index = _setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false);
+	base_specialization.line_shadow_pass_only = false;
 
 	rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_ALPHA, p_render_data, is_multiview, radiance_texture, samplers, transparent_pass_uniform_buffer_index, true);
 
@@ -2899,8 +2925,10 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 			}
 
 			if (is_line ? light_storage->light_instances_can_render_shadow_cube() : light_storage->light_omni_get_shadow_mode(base) == RSE::LIGHT_OMNI_SHADOW_CUBE) {
-				render_texture = light_storage->get_cubemap(shadow_size / 2);
-				render_fb = light_storage->get_cubemap_fb(shadow_size / 2, p_pass);
+				// Beyond the line's ends the polar map reads the face centres, too coarse at half size.
+				const uint32_t cube_size = is_line ? shadow_size : shadow_size / 2;
+				render_texture = light_storage->get_cubemap(cube_size);
+				render_fb = light_storage->get_cubemap_fb(cube_size, p_pass);
 
 				light_projection = light_storage->light_instance_get_shadow_camera(p_light, p_pass);
 				light_transform = light_storage->light_instance_get_shadow_transform(p_light, p_pass);

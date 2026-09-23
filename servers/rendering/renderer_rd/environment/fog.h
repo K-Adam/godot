@@ -188,6 +188,10 @@ private:
 			float cam_rotation[12];
 			float to_prev_view[16];
 			float radiance_inverse_xform[12];
+
+			uint32_t line_shadow_flags[8]; // LINE_FOG_* per screen-shadow layer.
+			uint32_t line_shadow_frame;
+			uint32_t line_shadow_pad[3];
 		};
 
 		VolumetricFogProcessShaderRD process_shader;
@@ -312,6 +316,21 @@ public:
 
 		RID light_density_map;
 		RID prev_light_density_map;
+		// Line lights' hidden fraction per froxel, one block of `depth` slices per
+		// screen-shadow layer, and last frame's.
+		RID line_shadow_map;
+		RID prev_line_shadow_map;
+		static constexpr uint32_t LINE_SHADOW_LAYERS = 8;
+		static constexpr uint32_t LINE_SHADOW_FRAMES = 16;
+		// False when the device cannot hold the maps' depth; line shadows then walk every frame.
+		bool line_shadow_cached = true;
+		struct {
+			uint64_t keys[LINE_SHADOW_LAYERS] = {};
+			uint64_t versions[LINE_SHADOW_LAYERS] = {};
+			uint32_t redrawn_frame[LINE_SHADOW_LAYERS] = {};
+			uint32_t layer_count = 0;
+			uint32_t frame = 0;
+		} line_shadow_history;
 		RID fog_map;
 		RID density_map;
 		RID light_map;

@@ -251,12 +251,15 @@ private:
 	struct LineShadowPyramidPushConstant {
 		int32_t offset[2];
 		int32_t size[2];
+		int32_t level;
+		int32_t atlas_size;
+		int32_t pad[2];
 	};
 
 	struct LineShadowPyramid {
 		LineShadowPyramidShaderRD shader;
 		RID shader_version;
-		PipelineDeferredRD pipelines[2];
+		PipelineDeferredRD pipelines[3];
 	} line_shadow_pyramid;
 
 	// Octmap effects

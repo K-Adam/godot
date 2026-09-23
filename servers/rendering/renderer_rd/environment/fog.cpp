@@ -32,6 +32,7 @@
 
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
+#include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_server_default.h"
@@ -487,6 +488,25 @@ void Fog::VolumetricFog::init(const Vector3i &fog_size, RID p_sky_shader) {
 	fog_map = RD::get_singleton()->texture_create(tf, RD::TextureView());
 	RD::get_singleton()->set_resource_name(fog_map, "Fog map");
 
+	{
+		RD::TextureFormat ltf = tf;
+		ltf.format = RD::DATA_FORMAT_R8G8_UNORM;
+		ltf.depth = fog_size.z * LINE_SHADOW_LAYERS;
+		line_shadow_cached = ltf.depth <= RD::get_singleton()->limit_get(RD::LIMIT_MAX_TEXTURE_SIZE_3D);
+		if (!line_shadow_cached) {
+			ltf.width = 1;
+			ltf.height = 1;
+			ltf.depth = 1;
+		}
+		ltf.usage_bits = RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+		line_shadow_map = RD::get_singleton()->texture_create(ltf, RD::TextureView());
+		RD::get_singleton()->set_resource_name(line_shadow_map, "Fog line shadow map");
+		ltf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+		prev_line_shadow_map = RD::get_singleton()->texture_create(ltf, RD::TextureView());
+		RD::get_singleton()->set_resource_name(prev_line_shadow_map, "Fog previous line shadow map");
+		RD::get_singleton()->texture_clear(prev_line_shadow_map, Color(0, 0, 0, 0), 0, 1, 0, 1);
+	}
+
 	if (atomic_type == RD::UNIFORM_TYPE_STORAGE_BUFFER) {
 		Vector<uint8_t> dm;
 		dm.resize_initialized(fog_size.x * fog_size.y * fog_size.z * 4);
@@ -527,6 +547,8 @@ Fog::VolumetricFog::~VolumetricFog() {
 	RD::get_singleton()->free_rid(prev_light_density_map);
 	RD::get_singleton()->free_rid(light_density_map);
 	RD::get_singleton()->free_rid(fog_map);
+	RD::get_singleton()->free_rid(line_shadow_map);
+	RD::get_singleton()->free_rid(prev_line_shadow_map);
 	RD::get_singleton()->free_rid(density_map);
 	RD::get_singleton()->free_rid(light_map);
 	RD::get_singleton()->free_rid(emissive_map);
@@ -1022,6 +1044,14 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 			uniforms.push_back(u);
 			copy_uniforms.push_back(u);
 		}
+		{
+			RD::Uniform u(RD::UNIFORM_TYPE_IMAGE, 25, fog->line_shadow_map);
+			uniforms.push_back(u);
+		}
+		{
+			RD::Uniform u(RD::UNIFORM_TYPE_TEXTURE, 26, fog->prev_line_shadow_map);
+			uniforms.push_back(u);
+		}
 		fog->line_light_buffer = p_settings.line_light_buffer;
 		fog->line_shadow_pyramid = p_settings.line_shadow_pyramid;
 
@@ -1162,6 +1192,42 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	params.use_temporal_reprojection = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_temporal_reprojection(p_settings.env);
 	params.temporal_blend = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_temporal_reprojection_amount(p_settings.env);
 
+	{
+		// Line lights' kept shadow: valid while the layer holds the same light seen from
+		// the same viewpoints; replaced for a refresh cycle after its maps change.
+		RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
+		static_assert(VolumetricFog::LINE_SHADOW_LAYERS == RendererRD::LightStorage::LINE_SCREEN_SHADOWS_MAX);
+		uint32_t layer_count = 0;
+		const bool *unused_contact = nullptr;
+		light_storage->get_line_screen_shadows(layer_count, unused_contact);
+		const RendererRD::LightStorage::LineScreenShadowState *states = light_storage->get_line_screen_shadow_states();
+		auto &history = fog->line_shadow_history;
+		const bool cache = params.use_temporal_reprojection && fog->line_shadow_cached;
+		if (!cache) {
+			history.layer_count = 0;
+		}
+		history.frame++;
+		params.line_shadow_frame = history.frame;
+		for (uint32_t i = 0; i < VolumetricFog::LINE_SHADOW_LAYERS; i++) {
+			params.line_shadow_flags[i] = 0;
+			if (i >= layer_count || !cache) {
+				continue;
+			}
+			if (i < history.layer_count && history.keys[i] == states[i].key) {
+				params.line_shadow_flags[i] = 1; // LINE_FOG_VALID
+				if (history.versions[i] != states[i].version) {
+					history.redrawn_frame[i] = history.frame;
+				}
+				if (history.frame - history.redrawn_frame[i] < VolumetricFog::LINE_SHADOW_FRAMES) {
+					params.line_shadow_flags[i] |= 2; // LINE_FOG_REDRAWN
+				}
+			}
+			history.keys[i] = states[i].key;
+			history.versions[i] = states[i].version;
+		}
+		history.layer_count = cache ? layer_count : 0;
+	}
+
 	RID sky_rid = RendererSceneRenderRD::get_singleton()->environment_get_sky(p_settings.env);
 	if (sky_rid.is_valid()) {
 		float uv_border_size = p_settings.sky->sky_get_uv_border_size(sky_rid);
@@ -1192,6 +1258,11 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	RENDER_TIMESTAMP("Render Fog");
 	RD::get_singleton()->buffer_update(volumetric_fog.params_ubo, 0, sizeof(VolumetricFogShader::ParamsUBO), &params);
 
+	if (fog->line_shadow_cached && params.use_temporal_reprojection) {
+		// Texels left unwritten read as invalid next frame.
+		RD::get_singleton()->texture_clear(fog->line_shadow_map, Color(0, 0, 0, 0), 0, 1, 0, 1);
+	}
+
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 
 	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, volumetric_fog.process_pipelines[using_sdfgi ? VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_WITH_SDFGI : VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY].get_rid());
@@ -1203,6 +1274,12 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	}
 	RD::get_singleton()->compute_list_dispatch_threads(compute_list, fog->width, fog->height, fog->depth);
 	RD::get_singleton()->compute_list_add_barrier(compute_list);
+
+	if (fog->line_shadow_cached && params.use_temporal_reprojection) {
+		RD::get_singleton()->compute_list_end();
+		RD::get_singleton()->texture_copy(fog->line_shadow_map, fog->prev_line_shadow_map, Vector3(), Vector3(), Vector3(fog->width, fog->height, fog->depth * VolumetricFog::LINE_SHADOW_LAYERS), 0, 0, 0, 0);
+		compute_list = RD::get_singleton()->compute_list_begin();
+	}
 
 	// Copy fog to history buffer
 	if (RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_temporal_reprojection(p_settings.env)) {

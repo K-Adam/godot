@@ -375,10 +375,13 @@ SSEffects::SSEffects() {
 #ifdef REAL_T_IS_DOUBLE
 			shadows_defines += "\n#define USE_DOUBLE_PRECISION\n";
 #endif
-			sscs.shadows_shader.initialize(Vector<String>{ "", "\n#define MODE_FILTER\n" }, shadows_defines);
+			sscs.shadows_shader.initialize(Vector<String>{ "\n#define MODE_WALK\n", "\n#define MODE_FILTER\n", "\n#define MODE_PENUMBRA\n", "\n#define MODE_RECORD\n", "\n#define MODE_CLASSIFY\n" }, shadows_defines);
 			sscs.shadows_shader_version = sscs.shadows_shader.version_create();
 			sscs.shadows_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 0));
 			sscs.shadows_filter_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 1));
+			sscs.shadows_penumbra_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 2));
+			sscs.shadows_record_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 3));
+			sscs.shadows_classify_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 4));
 		}
 	}
 
@@ -493,7 +496,16 @@ SSEffects::~SSEffects() {
 		sscs.line_filter_pipeline.free();
 		sscs.shadows_pipeline.free();
 		sscs.shadows_filter_pipeline.free();
+		sscs.shadows_penumbra_pipeline.free();
+		sscs.shadows_record_pipeline.free();
+		sscs.shadows_classify_pipeline.free();
 		sscs.shadows_shader.version_free(sscs.shadows_shader_version);
+		if (sscs.shadows_walk_list.is_valid()) {
+			RD::get_singleton()->free_rid(sscs.shadows_walk_list);
+		}
+		if (sscs.shadows_walk_args.is_valid()) {
+			RD::get_singleton()->free_rid(sscs.shadows_walk_args);
+		}
 		sscs.line_shader.version_free(sscs.line_shader_version);
 
 		RD::get_singleton()->free_rid(sscs.border_sampler);
@@ -1946,14 +1958,18 @@ static bool _line_shadow_textures_fit(Ref<RenderSceneBuffersRD> p_render_buffers
 	return false;
 }
 
-static void _line_shadow_texture_create(Ref<RenderSceneBuffersRD> p_render_buffers, const StringName &p_scope, const StringName &p_name, RD::DataFormat p_format, uint32_t p_layers) {
+// `p_placeholder`: 1x1, only to fill the shader's bindings.
+static void _line_shadow_texture_create(Ref<RenderSceneBuffersRD> p_render_buffers, const StringName &p_scope, const StringName &p_name, RD::DataFormat p_format, uint32_t p_layers, bool p_copyable = false, bool p_placeholder = false) {
 	RD::TextureFormat tf;
 	tf.format = p_format;
-	tf.width = p_render_buffers->get_internal_size().width;
-	tf.height = p_render_buffers->get_internal_size().height;
+	tf.width = p_placeholder ? 1 : p_render_buffers->get_internal_size().width;
+	tf.height = p_placeholder ? 1 : p_render_buffers->get_internal_size().height;
 	tf.array_layers = p_layers;
 	tf.texture_type = RD::TEXTURE_TYPE_2D_ARRAY;
 	tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT;
+	if (p_copyable) {
+		tf.usage_bits |= RD::TEXTURE_USAGE_CAN_COPY_FROM_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
+	}
 	p_render_buffers->create_texture_from_format(p_scope, p_name, tf);
 }
 
@@ -2009,17 +2025,80 @@ void SSEffects::line_light_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, c
 	const uint32_t view_count = p_render_buffers->get_view_count();
 	const Size2i size = p_render_buffers->get_internal_size();
 
+	// Stereo would need a reprojection per view; it walks every frame instead.
+	const uint32_t temporal_frames = view_count == 1 ? p_params.temporal_frames : 0;
+
 	uint32_t layers = p_params.light_count * view_count;
-	if (!_line_shadow_textures_fit(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY, layers)) {
-		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY, RD::DATA_FORMAT_R16G16_UNORM, layers);
+	// Temporal reuse keeps full-size history; without it, 1x1 stand-ins fill the bindings.
+	bool history_fits = p_render_buffers->has_texture(RB_SCOPE_LINE_SHADOWS, RB_LINE_HISTORY) &&
+			(p_render_buffers->get_texture_format(RB_SCOPE_LINE_SHADOWS, RB_LINE_HISTORY).width == 1) == (temporal_frames == 0);
+	bool fresh = false;
+	if (!_line_shadow_textures_fit(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY, layers) || !history_fits) {
+		p_render_buffers->clear_context(RB_SCOPE_LINE_SHADOWS);
+		const bool placeholder = temporal_frames == 0;
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY, RD::DATA_FORMAT_R16G16B16A16_UNORM, layers, true);
 		// Reused by each light in turn.
-		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY_TEMP, RD::DATA_FORMAT_R16G16_UNORM, view_count);
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY_TEMP, RD::DATA_FORMAT_R16G16B16A16_UNORM, view_count, true);
+		// Temporal reuse: each light's unfiltered visibility, and the view-space z it was for.
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_HISTORY, RD::DATA_FORMAT_R16G16B16A16_UNORM, layers, true, placeholder);
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_CURRENT_Z, RD::DATA_FORMAT_R32G32_SFLOAT, view_count, true, placeholder);
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_PREVIOUS_Z, RD::DATA_FORMAT_R32G32_SFLOAT, view_count, true, placeholder);
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_CURRENT_NORMAL, RD::DATA_FORMAT_R8G8B8A8_UNORM, view_count, true, placeholder);
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_PREVIOUS_NORMAL, RD::DATA_FORMAT_R8G8B8A8_UNORM, view_count, true, placeholder);
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_COUNT, RD::DATA_FORMAT_R32G32_SFLOAT, layers, true, placeholder);
+		_line_shadow_texture_create(p_render_buffers, RB_SCOPE_LINE_SHADOWS, RB_LINE_PREVIOUS_COUNT, RD::DATA_FORMAT_R32G32_SFLOAT, layers, true, placeholder);
+		fresh = true;
+	}
+	// One entry per pixel is the worst case. Shared by every light and viewport, since the
+	// walk it feeds runs before anything rewrites it.
+	const uint32_t walk_list_pixels = size.width * size.height;
+	if (sscs.shadows_walk_list_pixels < walk_list_pixels) {
+		if (sscs.shadows_walk_list.is_valid()) {
+			RD::get_singleton()->free_rid(sscs.shadows_walk_list);
+		}
+		sscs.shadows_walk_list = RD::get_singleton()->storage_buffer_create((1 + walk_list_pixels) * sizeof(uint32_t));
+		sscs.shadows_walk_list_pixels = walk_list_pixels;
+	}
+	if (sscs.shadows_walk_args.is_null()) {
+		sscs.shadows_walk_args = RD::get_singleton()->storage_buffer_create(3 * sizeof(uint32_t), Vector<uint8_t>(), RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
+	}
+	LocalVector<ObjectID> gone;
+	for (const KeyValue<ObjectID, LineShadowHistory> &E : line_shadow_histories) {
+		if (!ObjectDB::get_instance(E.key)) {
+			gone.push_back(E.key);
+		}
+	}
+	for (const ObjectID &id : gone) {
+		line_shadow_histories.erase(id);
+	}
+	LineShadowHistory &history = line_shadow_histories[p_render_buffers->get_instance_id()];
+	if (fresh || temporal_frames == 0) {
+		history.light_count = 0;
+	}
+	history.frame++;
+	uint32_t history_flags[LINE_SHADOW_HISTORY_MAX] = {};
+	for (uint32_t i = 0; i < p_params.light_count && temporal_frames > 0; i++) {
+		if (i >= history.light_count || history.keys[i] != p_params.light_keys[i]) {
+			history.redrawn_frame[i] = history.frame - temporal_frames;
+			continue;
+		}
+		history_flags[i] = LINE_SHADOW_HISTORY_VALID;
+		// Maps changed: each tile replaces its history on its next walk.
+		if (history.versions[i] != p_params.light_versions[i]) {
+			history.redrawn_frame[i] = history.frame;
+		}
+		if (history.frame - history.redrawn_frame[i] < temporal_frames) {
+			history_flags[i] |= LINE_SHADOW_HISTORY_REDRAWN;
+		}
 	}
 
 	RD::get_singleton()->draw_command_begin_label("Line Light Shadows");
 
 	RID shader = sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 0);
 	RID filter_shader = sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 1);
+	RID penumbra_shader = sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 2);
+	RID record_shader = sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 3);
+	RID classify_shader = sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 4);
 	RID nearest = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 	RID linear = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 	RD::Uniform u_lights(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, p_params.line_light_buffer);
@@ -2030,34 +2109,99 @@ void SSEffects::line_light_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, c
 	RD::Uniform u_lut1(RD::UNIFORM_TYPE_TEXTURE, 9, p_params.ltc_lut1);
 	RD::Uniform u_lut2(RD::UNIFORM_TYPE_TEXTURE, 10, p_params.ltc_lut2);
 	RD::Uniform u_scene(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 11, p_params.scene_data);
+	RD::Uniform u_walk_list(RD::UNIFORM_TYPE_STORAGE_BUFFER, 19, sscs.shadows_walk_list);
+	RD::Uniform u_walk_args(RD::UNIFORM_TYPE_STORAGE_BUFFER, 20, sscs.shadows_walk_args);
 
 	LineLightShadowsPushConstant push_constant = {};
 	push_constant.screen_size[0] = size.width;
 	push_constant.screen_size[1] = size.height;
 	push_constant.taa_frame_count = p_params.taa_frame_count;
+	push_constant.frame = history.frame;
+	push_constant.temporal_frames = temporal_frames;
+	MaterialStorage::store_camera(p_params.reprojection, push_constant.reprojection);
+	push_constant.prev_view_z[0] = p_params.prev_view_z.x;
+	push_constant.prev_view_z[1] = p_params.prev_view_z.y;
+	push_constant.prev_view_z[2] = p_params.prev_view_z.z;
+	push_constant.prev_view_z[3] = p_params.prev_view_z.w;
+	RID history_texture = p_render_buffers->get_texture(RB_SCOPE_LINE_SHADOWS, RB_LINE_HISTORY);
+	RID current_z_texture = p_render_buffers->get_texture(RB_SCOPE_LINE_SHADOWS, RB_LINE_CURRENT_Z);
+	RID previous_z_texture = p_render_buffers->get_texture(RB_SCOPE_LINE_SHADOWS, RB_LINE_PREVIOUS_Z);
+	RID current_normal_texture = p_render_buffers->get_texture(RB_SCOPE_LINE_SHADOWS, RB_LINE_CURRENT_NORMAL);
+	RID previous_normal_texture = p_render_buffers->get_texture(RB_SCOPE_LINE_SHADOWS, RB_LINE_PREVIOUS_NORMAL);
+	RID count_texture = p_render_buffers->get_texture(RB_SCOPE_LINE_SHADOWS, RB_LINE_COUNT);
+	RID previous_count_texture = p_render_buffers->get_texture(RB_SCOPE_LINE_SHADOWS, RB_LINE_PREVIOUS_COUNT);
 
 	for (uint32_t v = 0; v < view_count; v++) {
 		push_constant.view = v;
 		RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>{ nearest, p_render_buffers->get_depth_texture(v) });
 		RD::Uniform u_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 3, Vector<RID>{ nearest, p_params.normal_roughness_slices[v] });
 		RID temp = p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY_TEMP, v, 0);
+		RD::Uniform u_previous_z(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 13, Vector<RID>{ nearest, p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_PREVIOUS_Z, v, 0) });
+		RID current_z_slice = p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_CURRENT_Z, v, 0);
+		RID current_normal_slice = p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_CURRENT_NORMAL, v, 0);
+		RD::Uniform u_current_z(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 14, Vector<RID>{ nearest, current_z_slice });
+		RD::Uniform u_current_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 15, Vector<RID>{ nearest, current_normal_slice });
+
+		// This frame's surfaces, for the walks to compare against and the next frame to read.
+		if (temporal_frames > 0) {
+			RD::Uniform u_record_z(RD::UNIFORM_TYPE_IMAGE, 14, current_z_slice);
+			RD::Uniform u_record_normal(RD::UNIFORM_TYPE_IMAGE, 15, current_normal_slice);
+			RD::ComputeListID record_list = RD::get_singleton()->compute_list_begin();
+			RD::get_singleton()->compute_list_bind_compute_pipeline(record_list, sscs.shadows_record_pipeline.get_rid());
+			// The shader's set covers every binding the file declares, used or not.
+			RD::Uniform u_record_out(RD::UNIFORM_TYPE_IMAGE, 1, temp);
+			RD::Uniform u_record_src(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>{ nearest, texture_storage->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_BLACK) });
+			RD::get_singleton()->compute_list_bind_uniform_set(record_list, UniformSetCacheRD::get_singleton()->get_cache(record_shader, 0, u_depth, u_record_out, u_normal, u_record_src, u_scene, u_record_z, u_record_normal), 0);
+			RD::get_singleton()->compute_list_set_push_constant(record_list, &push_constant, sizeof(push_constant));
+			RD::get_singleton()->compute_list_dispatch_threads(record_list, size.width, size.height, 1);
+			RD::get_singleton()->compute_list_end();
+		}
+		RD::Uniform u_previous_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 16, Vector<RID>{ nearest, p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_PREVIOUS_NORMAL, v, 0) });
 
 		for (uint32_t i = 0; i < p_params.light_count; i++) {
-			RID layer = p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY, i * view_count + v, 0);
+			const uint32_t layer_index = i * view_count + v;
+			RID layer = p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY, layer_index, 0);
 			push_constant.light_index = p_params.lights[i];
 			push_constant.use_contact = p_params.contact[i];
+			push_constant.history_flags = history_flags[i];
+			RD::Uniform u_history(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 12, Vector<RID>{ nearest, p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_HISTORY, layer_index, 0) });
+			RD::Uniform u_count(RD::UNIFORM_TYPE_IMAGE, 17, p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_COUNT, layer_index, 0));
+			RD::Uniform u_previous_count(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 18, Vector<RID>{ nearest, p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_PREVIOUS_COUNT, layer_index, 0) });
 			RID contact = p_params.contact[i] ? p_render_buffers->get_texture_slice(RB_SCOPE_SSCS_LINE, RB_SSCS_RAW, i * view_count + v, 0) : texture_storage->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 			RD::Uniform u_raw(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>{ nearest, contact });
 
-			// Ping-pong so the last pass lands in the light's layer.
-			RID target = p_params.filter_passes % 2 == 0 ? layer : temp;
+			// Ping-pong so the last pass, the penumbra, lands in the light's layer.
+			RID target = (p_params.filter_passes + 1) % 2 == 0 ? layer : temp;
 			RD::Uniform u_output(RD::UNIFORM_TYPE_IMAGE, 1, target);
+
+			// An empty list. The row width is WALK_GROUPS_PER_ROW in the shader, which
+			// fills in how many rows the walkers it lists need.
+			const uint32_t empty_count = 0;
+			const uint32_t empty_groups[3] = { 256, 0, 1 };
+			RD::get_singleton()->buffer_update(sscs.shadows_walk_list, 0, sizeof(empty_count), &empty_count);
+			RD::get_singleton()->buffer_update(sscs.shadows_walk_args, 0, sizeof(empty_groups), empty_groups);
 			RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
-			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_pipeline.get_rid());
-			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(shader, 0, u_depth, u_output, u_lights, u_normal, u_raw, u_atlas, u_pyramid, u_nearest, u_linear, u_lut1, u_lut2, u_scene), 0);
+			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_classify_pipeline.get_rid());
+			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(classify_shader, 0, u_depth, u_output, u_lights, u_normal, u_raw, u_scene, u_history, u_previous_z, u_current_z, u_current_normal, u_previous_normal, u_count, u_previous_count, u_walk_list, u_walk_args), 0);
 			RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
 			RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
 			RD::get_singleton()->compute_list_end();
+
+			// Only the listed pixels walk, packed so a warp holds 64 of them.
+			compute_list = RD::get_singleton()->compute_list_begin();
+			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_pipeline.get_rid());
+			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(shader, 0, u_depth, u_output, u_lights, u_normal, u_raw, u_atlas, u_pyramid, u_nearest, u_linear, u_lut1, u_lut2, u_scene, u_count, u_walk_list), 0);
+			RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+			RD::get_singleton()->compute_list_dispatch_indirect(compute_list, sscs.shadows_walk_args, 0);
+			RD::get_singleton()->compute_list_end();
+
+			if (temporal_frames > 0) {
+				// Unfiltered, so the filter runs over each frame's result once.
+				const bool in_layer = target == layer;
+				RD::get_singleton()->texture_copy(p_render_buffers->get_texture(RB_SCOPE_LINE_SHADOWS, in_layer ? RB_LINE_VISIBILITY : RB_LINE_VISIBILITY_TEMP), history_texture,
+						Vector3(), Vector3(), Vector3(size.width, size.height, 1), 0, 0, in_layer ? layer_index : v, layer_index);
+				RD::get_singleton()->texture_copy(count_texture, previous_count_texture, Vector3(), Vector3(), Vector3(size.width, size.height, 1), 0, 0, layer_index, layer_index);
+			}
 
 			for (int pass = 0; pass < p_params.filter_passes; pass++) {
 				RID source = target;
@@ -2072,6 +2216,32 @@ void SSEffects::line_light_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, c
 				RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
 				RD::get_singleton()->compute_list_end();
 			}
+
+			{
+				RID source = target;
+				target = target == layer ? temp : layer;
+				RD::Uniform u_source(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>{ nearest, source });
+				RD::Uniform u_target(RD::UNIFORM_TYPE_IMAGE, 1, target);
+				compute_list = RD::get_singleton()->compute_list_begin();
+				RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_penumbra_pipeline.get_rid());
+				RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(penumbra_shader, 0, u_depth, u_target, u_lights, u_normal, u_source, u_scene), 0);
+				RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+				RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+				RD::get_singleton()->compute_list_end();
+			}
+		}
+
+		if (temporal_frames > 0 && p_params.light_count > 0) {
+			RD::get_singleton()->texture_copy(current_z_texture, previous_z_texture, Vector3(), Vector3(), Vector3(size.width, size.height, 1), 0, 0, v, v);
+			RD::get_singleton()->texture_copy(current_normal_texture, previous_normal_texture, Vector3(), Vector3(), Vector3(size.width, size.height, 1), 0, 0, v, v);
+		}
+	}
+
+	if (temporal_frames > 0) {
+		history.light_count = MIN(p_params.light_count, LINE_SHADOW_HISTORY_MAX);
+		for (uint32_t i = 0; i < history.light_count; i++) {
+			history.keys[i] = p_params.light_keys[i];
+			history.versions[i] = p_params.light_versions[i];
 		}
 	}
 

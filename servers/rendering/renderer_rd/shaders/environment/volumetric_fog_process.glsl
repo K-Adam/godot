@@ -194,6 +194,13 @@ layout(set = 0, binding = 15, std140) uniform Params {
 	mat4 to_prev_view;
 
 	mat3 radiance_inverse_xform;
+
+	uvec4 line_shadow_flags[2]; // LINE_FOG_* per screen-shadow layer.
+	uint line_shadow_frame; // Counts this fog's updates.
+	// Scalars: a std140 array would pad each element to 16 bytes.
+	uint line_shadow_pad_0;
+	uint line_shadow_pad_1;
+	uint line_shadow_pad_2;
 }
 params;
 #ifndef MODE_COPY
@@ -231,6 +238,20 @@ line_lights;
 
 layout(set = 0, binding = 23) uniform texture2D line_shadow_pyramid;
 layout(set = 0, binding = 24) uniform sampler SAMPLER_NEAREST_CLAMP;
+
+// Line lights with a screen-space shadow layer keep each froxel's hidden fraction, one
+// block of `depth` slices per layer, and walk it again only once in LINE_FOG_FRAMES.
+#define LINE_FOG_LAYERS 8
+#define LINE_FOG_FRAMES 16u
+// Last frame's fractions are this layer's light, from the same viewpoints.
+#define LINE_FOG_VALID 1u
+// Its shadow maps changed within LINE_FOG_FRAMES: walks replace, not blend.
+#define LINE_FOG_REDRAWN 2u
+#ifdef MODE_DENSITY
+// r: hidden fraction, g: 1 where written this frame (the map is cleared each frame).
+layout(rg8, set = 0, binding = 25) uniform restrict writeonly image3D line_shadow_map;
+layout(set = 0, binding = 26) uniform texture3D prev_line_shadow_map;
+#endif
 
 #include "../line_light_shadow_inc.glsl"
 
@@ -337,6 +358,9 @@ void main() {
 
 	vec4 reprojected_density = vec4(0.0);
 	float reproject_amount = 0.0;
+	// Where this froxel was last frame, in unit froxel coordinates, if it was in view.
+	vec3 prev_unit = vec3(0.0);
+	bool has_prev = false;
 
 	if (params.use_temporal_reprojection) {
 		vec3 prev_view = (params.to_prev_view * vec4(view_pos, 1.0)).xyz;
@@ -352,6 +376,8 @@ void main() {
 
 		if (all(greaterThan(prev_view, vec3(0.0))) && all(lessThan(prev_view, vec3(1.0)))) {
 			//reprojectinon fits
+			prev_unit = prev_view;
+			has_prev = true;
 
 			reprojected_density = textureLod(sampler3D(prev_density_texture, linear_sampler), prev_view, 0.0);
 			reproject_amount = params.temporal_blend;
@@ -753,14 +779,45 @@ void main() {
 
 					float shadow_attenuation = 1.0;
 					if (line_lights.data[light_index].shadow_opacity > 0.001 && dot(light_vec, light_vec) > 0.0) {
-						// Facing the closest point keeps the segment above the horizon; each cell is 1/64
-						// of line_measure(). The noise only moves when reprojection averages it.
-						LineShadowContext ctx = line_shadow_begin(light_index, view_pos, light_vec, params.use_temporal_reprojection ? float(params.temporal_frame) : 0.0, vec2(pos.xy) + float(pos.z) * vec2(17.0, 31.0), params.shadow_atlas_pixel_size);
-						LineShadowCells cells = line_shadow_cells(ctx.receiver.z, max(length(ctx.receiver.xy), LINE_LIGHT_MIN_DISTANCE), 0.5 * sqrt(length_sq), ctx.jitter);
-						uvec2 hidden;
-						uvec2 unused;
-						line_shadow_mask(ctx, cells, cells, true, false, hidden, unused);
-						shadow_attenuation = 1.0 - line_lights.data[light_index].shadow_opacity * float(bitCount(hidden.x) + bitCount(hidden.y)) / 64.0;
+						int layer = abs(int(line_lights.data[light_index].cone_angle)) - 1;
+						uint flags = layer >= 0 && layer < LINE_FOG_LAYERS ? params.line_shadow_flags[layer / 4][layer % 4] : 0u;
+						float hidden_fraction = 0.0;
+						bool has_history = has_prev && (flags & LINE_FOG_VALID) != 0u;
+						if (has_history) {
+							// Kept inside the layer's own slices, so filtering never reaches the next.
+							float depth_slices = float(params.fog_volume_size.z);
+							float z = clamp(prev_unit.z * depth_slices, 0.5, depth_slices - 0.5) + float(layer) * depth_slices;
+							vec2 kept = textureLod(sampler3D(prev_line_shadow_map, linear_sampler), vec3(prev_unit.xy, z / (depth_slices * float(LINE_FOG_LAYERS))), 0.0).rg;
+							// Taps that were not written last frame carry nothing.
+							has_history = kept.y > 0.5;
+							hidden_fraction = has_history ? kept.x / kept.y : 0.0;
+						}
+						// Whole workgroups walk together, spread over the frames by a hash.
+						uvec3 group = gl_WorkGroupID;
+						bool refresh = ((group.x * 73856093u) ^ (group.y * 19349663u) ^ (group.z * 83492791u)) % LINE_FOG_FRAMES == params.line_shadow_frame % LINE_FOG_FRAMES;
+						if (!has_history || refresh) {
+							// Facing the closest point keeps the segment above the horizon; each cell is 1/64
+							// of line_measure(). The noise only moves when reprojection averages it.
+							// A group walks on the same step of the 16-frame cycle each time, so its
+							// noise follows the fog's own count instead.
+							LineShadowContext ctx = line_shadow_begin(light_index, view_pos, light_vec, params.use_temporal_reprojection ? float(params.line_shadow_frame % 1024u) : 0.0, vec2(pos.xy) + float(pos.z) * vec2(17.0, 31.0), params.shadow_atlas_pixel_size);
+							// A fog cell spans many pixels; blocker detail under two cells of the
+							// segment does not show in it.
+							ctx.coarse_cells = 2.0;
+							// Nor does the parallax between neighbouring viewpoints.
+							ctx.reach_scale = 4.0;
+							LineShadowCells cells = line_shadow_cells(ctx.receiver.z, max(length(ctx.receiver.xy), LINE_LIGHT_MIN_DISTANCE), 0.5 * sqrt(length_sq), ctx.jitter);
+							uvec2 hidden;
+							uvec2 unused;
+							line_shadow_mask(ctx, cells, cells, true, false, hidden, unused);
+							float walked = float(bitCount(hidden.x) + bitCount(hidden.y)) / 64.0;
+							// Averaging the jittered walks also smooths their noise.
+							hidden_fraction = has_history && (flags & LINE_FOG_REDRAWN) == 0u ? mix(hidden_fraction, walked, 0.5) : walked;
+						}
+						if (layer >= 0 && layer < LINE_FOG_LAYERS) {
+							imageStore(line_shadow_map, ivec3(pos.xy, pos.z + layer * params.fog_volume_size.z), vec4(hidden_fraction, 1.0, 0.0, 0.0));
+						}
+						shadow_attenuation = 1.0 - line_lights.data[light_index].shadow_opacity * hidden_fraction;
 					}
 					total_light += line_lights.data[light_index].color * attenuation * shadow_attenuation * henyey_greenstein(dot(light_vec, safe_normalize(view_pos)), params.phase_g) * line_lights.data[light_index].volumetric_fog_energy;
 				}

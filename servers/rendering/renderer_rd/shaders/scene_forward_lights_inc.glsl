@@ -1324,8 +1324,11 @@ void light_process_area(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, vec3
 
 #include "line_light_shadow_inc.glsl"
 
-// GGX alpha below which the screen-space pass's specular visibility is not used.
-#define LINE_SHADOW_PASS_MIN_ALPHA 0.02
+// GGX alpha below which the screen-space pass's specular visibility is not used: the
+// G-buffer's normal is up to a few tenths of a degree off, which moves a narrower lobe's
+// mirror point by more than its width. The pass takes its normal from depth where that
+// is within half a degree of the G-buffer's, so flat surfaces are exact even so.
+#define LINE_SHADOW_PASS_MIN_ALPHA 0.002
 
 #endif // !SHADOWS_DISABLED
 
@@ -1512,6 +1515,14 @@ void light_process_line(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, hvec
 		shadow_walk = float(roughness) * float(roughness) < LINE_SHADOW_PASS_MIN_ALPHA;
 #endif
 	}
+#ifndef LIGHT_ANISOTROPY_USED
+	// Every shadowed line light has a layer and every fragment is the pass's surface:
+	// the walk below is compiled out, which keeps the whole shader lighter. Curved
+	// mirrors then take the pass's specular visibility too.
+	if (sc_line_shadow_pass_only()) {
+		shadow_walk = false;
+	}
+#endif
 #endif
 	if (shadow_walk) {
 		LineShadowContext ctx = line_shadow_begin(idx, vertex, vec3(normal), taa_frame_count, gl_FragCoord.xy, scene_data_block.data.shadow_atlas_pixel_size);

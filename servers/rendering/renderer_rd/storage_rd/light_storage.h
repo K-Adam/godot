@@ -55,6 +55,10 @@ public:
 
 	// Shadowed line lights given a screen-space layer per frame.
 	static constexpr uint32_t LINE_SCREEN_SHADOWS_MAX = 8;
+	struct LineScreenShadowState {
+		uint64_t key = 0; // Changes when what the light sees from changes.
+		uint64_t version = 0; // Changes when any of its shadow maps is redrawn.
+	};
 
 private:
 	static LightStorage *singleton;
@@ -201,7 +205,12 @@ private:
 	uint32_t line_light_count = 0;
 	uint32_t line_screen_shadows[LINE_SCREEN_SHADOWS_MAX];
 	bool line_screen_shadow_contact[LINE_SCREEN_SHADOWS_MAX];
+	// Per screen-space shadow: what its shadow looks from (instance, transform, params,
+	// atlas slots), and a value that changes whenever its maps are redrawn.
+	LineScreenShadowState line_screen_shadow_state[LINE_SCREEN_SHADOWS_MAX];
 	uint32_t line_screen_shadow_count = 0;
+	// A shadowed line light found no screen-space layer.
+	bool line_screen_shadows_overflow = false;
 	LightData *omni_lights = nullptr;
 	LightData *spot_lights = nullptr;
 	LightData *area_lights = nullptr;
@@ -887,6 +896,10 @@ public:
 		r_count = line_screen_shadow_count;
 		r_contact = line_screen_shadow_contact;
 		return line_screen_shadows;
+	}
+	bool line_screen_shadows_overflowed() const { return line_screen_shadows_overflow; }
+	const LineScreenShadowState *get_line_screen_shadow_states() const {
+		return line_screen_shadow_state;
 	}
 	RID get_directional_light_buffer() { return directional_light_buffer; }
 	uint32_t get_max_directional_lights() { return max_directional_lights; }

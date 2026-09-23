@@ -3714,6 +3714,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/lights_and_shadows/positional_shadow/line_light_section_length", PROPERTY_HINT_RANGE, "0.25,32,0.25,or_greater,suffix:m"), 1.5);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/lights_and_shadows/positional_shadow/line_light_max_sections", PROPERTY_HINT_RANGE, "1,16,1"), 8);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/lights_and_shadows/positional_shadow/line_light_shadow_filter", PROPERTY_HINT_ENUM, "Disabled,Low,High"), 1);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/lights_and_shadows/positional_shadow/line_light_shadow_temporal_frames", PROPERTY_HINT_RANGE, "0,32,1"), 0);
 	GLOBAL_DEF("rendering/lights_and_shadows/positional_shadow/atlas_16_bits", true);
 
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/2d/shadow_atlas/size", PROPERTY_HINT_RANGE, "128,16384"), 2048);

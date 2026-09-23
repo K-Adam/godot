@@ -72,3 +72,23 @@ uvec2 line_shadow_cell_bits(LineShadowCells c, float u0, float u1) {
 	int b = min(int(floor(clamp(line_shadow_cell_of(c, u1), -1.0, 64.0))), 63);
 	return b < a ? uvec2(0u) : line_mask_range(a, b);
 }
+
+// Neighbouring depths within this many texels are joined into one surface.
+#define LINE_SHADOW_CONTINUITY 6.0
+
+// Whether two neighbouring stored depths (1 - distance / far) are one surface.
+bool line_shadow_joined(float a, float b, float continuity) {
+	return a > 0.0 && b > 0.0 && abs(a - b) <= continuity * min(1.0 - a, 1.0 - b);
+}
+
+// Resampled depths bend straight surfaces by up to this many texels.
+#define LINE_SHADOW_STRAIGHT_TEXELS 3.0
+
+// Per row and per block as wide as a texel of pyramid level 2, 4, 6 or 8, a code:
+// pieces << 4 | bend in quarter texels. Pieces is 1 for one straight joined surface,
+// k + 2 for two split after texel k, or 0. That pyramid texel is negated if any of its
+// rows has pieces. This is where block `b` of row `y` of the slot at `x0` is kept.
+ivec2 line_shadow_row_texel(int x0, int y, int size, int level, int b, int atlas_size) {
+	int before = ((size >> 2) - (size >> level)) / 3;
+	return ivec2(x0 / 8 + before + b + (y & 1) * (atlas_size / 8), atlas_size / 4 + (y >> 1));
+}

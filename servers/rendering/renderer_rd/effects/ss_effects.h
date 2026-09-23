@@ -30,6 +30,10 @@
 
 #pragma once
 
+#include "core/math/projection.h"
+#include "core/math/vector4.h"
+#include "core/object/object_id.h"
+#include "core/templates/hash_map.h"
 #include "servers/rendering/renderer_rd/pipeline_deferred_rd.h"
 #include "servers/rendering/renderer_rd/shaders/effects/line_light_contact_shadows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/line_light_shadows.glsl.gen.h"
@@ -77,6 +81,13 @@
 #define RB_SSCS_RAW SNAME("sscs_raw")
 #define RB_LINE_VISIBILITY SNAME("visibility")
 #define RB_LINE_VISIBILITY_TEMP SNAME("visibility_temp")
+#define RB_LINE_HISTORY SNAME("history")
+#define RB_LINE_CURRENT_Z SNAME("current_z")
+#define RB_LINE_PREVIOUS_Z SNAME("previous_z")
+#define RB_LINE_CURRENT_NORMAL SNAME("current_normal")
+#define RB_LINE_PREVIOUS_NORMAL SNAME("previous_normal")
+#define RB_LINE_COUNT SNAME("count")
+#define RB_LINE_PREVIOUS_COUNT SNAME("previous_count")
 
 class RenderSceneBuffersRD;
 
@@ -87,6 +98,9 @@ class CopyEffects;
 class SSEffects {
 private:
 	static SSEffects *singleton;
+	// As HISTORY_* in line_light_shadows.glsl.
+	static constexpr uint32_t LINE_SHADOW_HISTORY_VALID = 1;
+	static constexpr uint32_t LINE_SHADOW_HISTORY_REDRAWN = 2;
 
 public:
 	static SSEffects *get_singleton() { return singleton; }
@@ -184,6 +198,8 @@ public:
 	void sscs_allocate_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, SSCSRenderBuffers &p_sscs_buffers, uint32_t p_contact_shadow_count);
 	void screen_space_contact_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, SSCSRenderBuffers &p_sscs_buffers, const SSCSSettings &p_settings, const Projection *p_projections, Vector3 p_light_direction, uint32_t p_light_index, float p_opacity, float p_blur, float p_taa_frame_count);
 
+	// Line lights with a screen-space shadow layer; LightStorage::LINE_SCREEN_SHADOWS_MAX.
+	static constexpr uint32_t LINE_SHADOW_HISTORY_MAX = 8;
 	struct LineShadowParams {
 		const uint32_t *lights = nullptr; // Line light buffer indices; one layer each per view.
 		const bool *contact = nullptr; // Per light: whether to march contact shadows.
@@ -203,6 +219,12 @@ public:
 		RID ltc_lut1;
 		RID ltc_lut2;
 		int filter_passes = 1;
+		// Temporal reuse; 0 walks every pixel every frame. See LightStorage::LineScreenShadowState.
+		uint32_t temporal_frames = 0;
+		const uint64_t *light_keys = nullptr;
+		const uint64_t *light_versions = nullptr;
+		Projection reprojection; // Current view space to last frame's clip space.
+		Vector4 prev_view_z; // Row of current view space to last frame's view-space z.
 	};
 	// Contact shadow hits only.
 	void line_light_contact_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, const LineShadowParams &p_params);
@@ -571,6 +593,13 @@ private:
 		RID shadows_shader_version;
 		PipelineDeferredRD shadows_pipeline;
 		PipelineDeferredRD shadows_filter_pipeline;
+		PipelineDeferredRD shadows_penumbra_pipeline;
+		PipelineDeferredRD shadows_record_pipeline;
+		PipelineDeferredRD shadows_classify_pipeline;
+		// The pixels MODE_CLASSIFY hands to the walk, and the walk's dispatch size.
+		RID shadows_walk_list;
+		RID shadows_walk_args;
+		uint32_t shadows_walk_list_pixels = 0;
 	} sscs;
 
 	struct LineLightContactShadowsPushConstant {
@@ -591,8 +620,23 @@ private:
 		uint32_t use_contact;
 		int32_t tap_step;
 		float taa_frame_count;
-		float pad;
+		uint32_t frame;
+		float reprojection[16];
+		float prev_view_z[4];
+		uint32_t temporal_frames;
+		uint32_t history_flags;
+		uint32_t pad[2];
 	};
+
+	// What each viewport's line shadow history was made from.
+	struct LineShadowHistory {
+		uint64_t keys[LINE_SHADOW_HISTORY_MAX] = {};
+		uint64_t versions[LINE_SHADOW_HISTORY_MAX] = {};
+		uint32_t redrawn_frame[LINE_SHADOW_HISTORY_MAX] = {}; // When its maps last changed.
+		uint32_t light_count = 0;
+		uint32_t frame = 0;
+	};
+	HashMap<ObjectID, LineShadowHistory> line_shadow_histories;
 
 	// Marches light `p_light` for view `p_view` into the R8 image `p_output`.
 	void _line_light_contact_march(Ref<RenderSceneBuffersRD> p_render_buffers, const LineShadowParams &p_params, uint32_t p_view, uint32_t p_light, RID p_output);

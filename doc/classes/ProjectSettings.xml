@@ -3207,6 +3207,7 @@
 		</member>
 		<member name="rendering/lights_and_shadows/positional_shadow/atlas_quadrant_0_subdiv" type="int" setter="" getter="" default="2">
 			The subdivision amount of the first quadrant on the shadow atlas. See the [url=$DOCS_URL/tutorials/3d/lights_and_shadows.html#shadow-atlas]documentation[/url] for more information.
+			[b]Note:[/b] [OmniLight3D] and [LineLight3D] shadows take two neighboring shadows of a quadrant, so no quadrant subdivided into [code]1[/code] shadow ever holds them.
 		</member>
 		<member name="rendering/lights_and_shadows/positional_shadow/atlas_quadrant_1_subdiv" type="int" setter="" getter="" default="2">
 			The subdivision amount of the second quadrant on the shadow atlas. See the [url=$DOCS_URL/tutorials/3d/lights_and_shadows.html#shadow-atlas]documentation[/url] for more information.
@@ -3232,8 +3233,13 @@
 		</member>
 		<member name="rendering/lights_and_shadows/positional_shadow/line_light_shadow_filter" type="int" setter="" getter="" default="1">
 			Screen-space filtering of [LineLight3D] shadows. Line light shadows are estimated with a fine dither pattern, which temporal antialiasing averages out. With filtering, the shadows of the 8 shadowed line lights nearest to the camera are computed in a separate pass before the opaque pass and smoothed over neighboring pixels of the same surface, which removes the dither without temporal antialiasing, and is usually faster than [code]Disabled[/code]. [code]Low[/code] averages each pixel with its 3×3 neighborhood; [code]High[/code] adds a second, twice as wide pass.
-			Transparent surfaces, materials that write [code]LIGHT_VERTEX[/code], other line lights, and the reflections on very glossy surfaces (roughness below about [code]0.14[/code]) keep the unfiltered shadows.
+			Transparent surfaces, materials that write [code]LIGHT_VERTEX[/code], and other line lights keep the unfiltered shadows. With MSAA, so do the reflections on mirror-like surfaces (roughness below about [code]0.045[/code]); without it, their reflected shadows may be slightly misplaced on curved surfaces.
 			[b]Note:[/b] Only supported in the Forward+ renderer, and only with the depth prepass. While a shadowed line light is visible, the depth prepass also writes normals and roughness, which makes it more expensive.
+		</member>
+		<member name="rendering/lights_and_shadows/positional_shadow/line_light_shadow_temporal_frames" type="int" setter="" getter="" default="0">
+			If above [code]0[/code], the screen-space pass of [member rendering/lights_and_shadows/positional_shadow/line_light_shadow_filter] keeps each pixel's [LineLight3D] shadow from the previous frame, following the camera's motion, and recomputes it only once in this many frames, in blocks of 8×8 pixels spread over the screen. Pixels whose surface the previous frame did not show at that depth and facing, such as those a moving camera uncovers or those of a moving object, start over and are recomputed every frame until they hold a few results. Each pixel's results are averaged, the newest weighing at least one sixteenth, which with temporal antialiasing also removes the shadows' dither noise.
+			This makes line light shadows up to this many times cheaper while their shadow maps stay cached, that is while nothing that casts into them moves. When a caster moves, every block replaces its kept shadow on its next recomputation, so the new shadow appears block by block over this many frames; keep this low where that is common. When the light itself moves, or its range, size, bias or shadow opacity changes, the kept shadows are dropped and every pixel is recomputed that frame. [code]8[/code] to [code]16[/code] suits mostly static scenes.
+			[b]Note:[/b] Only supported in the Forward+ renderer, with the depth prepass and [member rendering/lights_and_shadows/positional_shadow/line_light_shadow_filter] above [code]Disabled[/code]. Stereo views are recomputed every frame.
 		</member>
 		<member name="rendering/lights_and_shadows/positional_shadow/soft_shadow_filter_quality" type="int" setter="" getter="" default="2">
 			Quality setting for shadows cast by [OmniLight3D]s and [SpotLight3D]s. Higher quality settings use more samples when reading from shadow maps and are thus slower. Low quality settings may result in shadows looking grainy.

@@ -158,6 +158,11 @@ bool sc_cluster_has_line_light() {
 	return ((sc_packed_1() >> 8) & 1U) != 0;
 }
 
+// Opaque pass under the line light shadow pass, with a layer for every shadowed line light.
+bool sc_line_shadow_pass_only() {
+	return ((sc_packed_1() >> 9) & 1U) != 0;
+}
+
 float sc_luminance_multiplier() {
 	// Not used in clustered renderer but we share some code with the mobile renderer that requires this.
 	return 1.0;

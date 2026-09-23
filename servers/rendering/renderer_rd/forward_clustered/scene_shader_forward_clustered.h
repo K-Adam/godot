@@ -131,6 +131,7 @@ public:
 				uint32_t use_lightmap_specular : 1;
 				uint32_t material_feedback : 1;
 				uint32_t cluster_has_line_light : 1;
+				uint32_t line_shadow_pass_only : 1;
 			};
 		};
 

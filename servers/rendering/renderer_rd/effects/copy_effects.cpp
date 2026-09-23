@@ -163,10 +163,11 @@ CopyEffects::CopyEffects(BitField<RasterEffects> p_raster_effects) {
 		Vector<String> pyramid_modes;
 		pyramid_modes.push_back("\n#define MODE_FROM_ATLAS\n");
 		pyramid_modes.push_back("\n");
+		pyramid_modes.push_back("\n#define MODE_ROWS\n");
 
 		line_shadow_pyramid.shader.initialize(pyramid_modes);
 		line_shadow_pyramid.shader_version = line_shadow_pyramid.shader.version_create();
-		for (int i = 0; i < 2; i++) {
+		for (int i = 0; i < 3; i++) {
 			line_shadow_pyramid.pipelines[i].create_compute_pipeline(line_shadow_pyramid.shader.version_get_shader(line_shadow_pyramid.shader_version, i));
 		}
 	}
@@ -405,7 +406,7 @@ CopyEffects::~CopyEffects() {
 
 	copy_to_fb.shader.version_free(copy_to_fb.shader_version);
 	cube_to_dp.shader.version_free(cube_to_dp.shader_version);
-	for (int i = 0; i < 2; i++) {
+	for (int i = 0; i < 3; i++) {
 		line_shadow_pyramid.pipelines[i].free();
 	}
 	line_shadow_pyramid.shader.version_free(line_shadow_pyramid.shader_version);
@@ -1157,7 +1158,7 @@ void CopyEffects::build_line_shadow_pyramid(RID p_atlas, const RID *p_levels, in
 		RD::Uniform u_source = level == 0 ? RD::Uniform(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, p_atlas })) : RD::Uniform(RD::UNIFORM_TYPE_IMAGE, 0, p_levels[level - 1]);
 		RD::Uniform u_dest(RD::UNIFORM_TYPE_IMAGE, 0, p_levels[level]);
 
-		LineShadowPyramidPushConstant push_constant;
+		LineShadowPyramidPushConstant push_constant = {};
 		push_constant.offset[0] = from.x;
 		push_constant.offset[1] = from.y;
 		push_constant.size[0] = to.x - from.x;
@@ -1169,6 +1170,34 @@ void CopyEffects::build_line_shadow_pyramid(RID p_atlas, const RID *p_levels, in
 		RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(LineShadowPyramidPushConstant));
 		RD::get_singleton()->compute_list_dispatch_threads(compute_list, push_constant.size[0], push_constant.size[1], 1);
 		RD::get_singleton()->compute_list_add_barrier(compute_list);
+	}
+
+	// Per-row block data for levels 2, 4, 6 and 8; only read for slots of
+	// LINE_SHADOW_PIECES_MIN_SIZE or more.
+	const int slot = p_rect.size.x;
+	if (slot >= 1024) {
+		RID shader = line_shadow_pyramid.shader.version_get_shader(line_shadow_pyramid.shader_version, 2);
+		ERR_FAIL_COND(shader.is_null());
+		RD::Uniform u_atlas(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ sampler, p_atlas }));
+		RD::Uniform u_rows(RD::UNIFORM_TYPE_IMAGE, 0, p_levels[0]);
+		RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, line_shadow_pyramid.pipelines[2].get_rid());
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 0, u_atlas), 0);
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 1, u_rows), 1);
+		const int atlas_size = RD::get_singleton()->texture_get_format(p_atlas).width;
+		for (int level = 2; level < p_level_count && (4 << level) <= slot; level += 2) {
+			RD::Uniform u_level(RD::UNIFORM_TYPE_IMAGE, 0, p_levels[level]);
+			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, uniform_set_cache->get_cache(shader, 2, u_level), 2);
+
+			LineShadowPyramidPushConstant push_constant = {};
+			push_constant.offset[0] = p_rect.position.x;
+			push_constant.offset[1] = p_rect.position.y;
+			push_constant.size[0] = slot >> (level + 2);
+			push_constant.size[1] = slot;
+			push_constant.level = level;
+			push_constant.atlas_size = atlas_size;
+			RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(LineShadowPyramidPushConstant));
+			RD::get_singleton()->compute_list_dispatch_threads(compute_list, push_constant.size[0], push_constant.size[1], 1);
+		}
 	}
 	RD::get_singleton()->compute_list_end();
 }

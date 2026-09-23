@@ -892,6 +892,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 	area_light_count = 0;
 	line_light_count = 0;
 	line_screen_shadow_count = 0;
+	line_screen_shadows_overflow = false;
 	uint32_t directional_contact_shadows_count = 0;
 
 	// The positional light types are packed identically; only the arrays they
@@ -1354,7 +1355,8 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 
 					RendererRD::MaterialStorage::store_transform(proj, light_data.shadow_matrix);
 
-					// `size` is a regularization radius, not a softness.
+					// `size` regularizes shading, and the screen-space pass also takes it for the
+					// tube's radius in its penumbra; the omni/spot PCSS path does not apply.
 					light_data.soft_shadow_size = 0.0;
 
 					light_data.direction[0] = omni_offset.x * float(rect.size.width);
@@ -1401,7 +1403,31 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 					}
 
 					// Screen-space layer, nearest lights first.
+					line_screen_shadows_overflow = line_screen_shadows_overflow || (light_data.shadow_opacity > 0.0 && line_screen_shadow_count == LINE_SCREEN_SHADOWS_MAX);
 					if (light_data.shadow_opacity > 0.0 && line_screen_shadow_count < LINE_SCREEN_SHADOWS_MAX) {
+						LineScreenShadowState &state = line_screen_shadow_state[line_screen_shadow_count];
+						state.key = hash_djb2_one_64(light_instance->self.get_id());
+						state.key = hash_djb2_one_64(hash_murmur3_buffer(&light_transform, sizeof(Transform3D)), state.key);
+						// Only what the shadow depends on: an animated energy must not drop the history.
+						for (RSE::LightParam param : { RSE::LIGHT_PARAM_RANGE, RSE::LIGHT_PARAM_SIZE, RSE::LIGHT_PARAM_SHADOW_BIAS, RSE::LIGHT_PARAM_SHADOW_NORMAL_BIAS }) {
+							state.key = hash_djb2_one_64(hash_murmur3_one_float(light->param[param]), state.key);
+						}
+						// Includes the distance fade, and is baked into the visibility.
+						state.key = hash_djb2_one_64(uint32_t(light_data.shadow_opacity * 255.0f + 0.5f), state.key);
+						state.key = hash_djb2_one_64(hash_murmur3_one_float(light->line_length), state.key);
+						state.version = 0;
+						const ShadowAtlas *atlas = shadow_atlas_owner.get_or_null(p_shadow_atlas);
+						for (uint32_t s = 0; s < light_instance_get_shadow_section_count(light_instance->self); s++) {
+							RID section = light_instance_get_shadow_section(light_instance->self, s);
+							const uint32_t *slot = atlas ? atlas->shadow_owners.getptr(section) : nullptr;
+							if (!slot) {
+								state.key = hash_djb2_one_64(SHADOW_INVALID, state.key);
+								continue;
+							}
+							state.key = hash_djb2_one_64(*slot, state.key);
+							// Sections share the light's version; a slot yet to be redrawn lags.
+							state.version = MAX(state.version, atlas->quadrants[(*slot >> QUADRANT_SHIFT) & 0x3].shadows[*slot & SHADOW_INDEX_MASK].version);
+						}
 						line_screen_shadow_contact[line_screen_shadow_count] = light->allow_contact_shadows;
 						line_screen_shadows[line_screen_shadow_count++] = index;
 						light_data.cos_spot_angle = light->allow_contact_shadows ? float(line_screen_shadow_count) : -float(line_screen_shadow_count);
@@ -2580,12 +2606,13 @@ const RID *LightStorage::shadow_atlas_get_line_pyramid_levels(RID p_atlas, int &
 		return nullptr;
 	}
 	if (atlas->line_pyramid.is_null()) {
-		// Level 0 covers 4x4 atlas texels, and each level after it twice that.
+		// Level 0 covers 4x4 atlas texels, and each level after it twice that. Per-row
+		// block data sits below level 0.
 		atlas->line_pyramid_level_count = MIN(LINE_SHADOW_PYRAMID_LEVELS, (int)Math::floor_log2((uint32_t)atlas->size / 4) + 1);
 		RD::TextureFormat tf;
 		tf.format = RD::DATA_FORMAT_R32_SFLOAT;
 		tf.width = atlas->size / 4;
-		tf.height = atlas->size / 4;
+		tf.height = atlas->size / 4 + atlas->size / 2;
 		tf.mipmaps = atlas->line_pyramid_level_count;
 		tf.usage_bits = RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_CAN_COPY_TO_BIT;
 		atlas->line_pyramid = RD::get_singleton()->texture_create(tf, RD::TextureView());
@@ -2915,6 +2942,29 @@ bool LightStorage::shadow_atlas_update_light(RID p_atlas, RID p_light_instance, 
 		found_shadow = _shadow_atlas_find_shadow(shadow_atlas, valid_quadrants, valid_quadrant_count, old_subdivision, tick, new_quadrant, new_shadow);
 	}
 
+	if (!found_shadow && old_quadrant == SHADOW_INVALID && best_size != -1) {
+		// Every fitting tier is full: a free larger slot beats none, which for a line light
+		// loses real shadow. Largest first, as the search tries the last entry first.
+		int larger_quadrants[4];
+		int larger_quadrant_count = 0;
+		for (int i = 3; i >= 0; i--) {
+			int q = shadow_atlas->size_order[i];
+			int sd = shadow_atlas->quadrants[q].subdivision;
+			if (sd != 0 && int(quad_size / sd) > best_size) {
+				larger_quadrants[larger_quadrant_count++] = q;
+			}
+		}
+		if (is_omni) {
+			found_shadow = _shadow_atlas_find_omni_shadows(shadow_atlas, larger_quadrants, larger_quadrant_count, old_subdivision, tick, new_quadrant, new_shadow);
+		} else {
+			found_shadow = _shadow_atlas_find_shadow(shadow_atlas, larger_quadrants, larger_quadrant_count, old_subdivision, tick, new_quadrant, new_shadow);
+		}
+		if (found_shadow) {
+			const ShadowAtlas::Quadrant::Shadow *found = &shadow_atlas->quadrants[new_quadrant].shadows[new_shadow];
+			found_shadow = !found[0].owner.is_valid() && (!is_omni || !found[1].owner.is_valid());
+		}
+	}
+
 	if (found_shadow) {
 		if (old_quadrant != SHADOW_INVALID) {
 			shadow_atlas->quadrants[old_quadrant].shadows.write[old_shadow].version = 0;
@@ -2956,6 +3006,11 @@ bool LightStorage::shadow_atlas_update_light(RID p_atlas, RID p_light_instance, 
 		return true;
 	}
 
+	if (old_quadrant != SHADOW_INVALID) {
+		// No better slot yet; the old one is kept and is now up to date. Without this,
+		// a light waiting for a better tier redraws every frame until it gets one.
+		shadow_atlas->quadrants[old_quadrant].shadows.write[old_shadow].version = p_light_version;
+	}
 	return should_redraw;
 }
 

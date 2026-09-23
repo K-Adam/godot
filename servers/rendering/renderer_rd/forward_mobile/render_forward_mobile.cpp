@@ -1575,8 +1575,10 @@ void RenderForwardMobile::_render_shadow_pass(RID p_light, RID p_shadow_atlas, i
 			}
 
 			if (is_line ? light_storage->light_instances_can_render_shadow_cube() : light_storage->light_omni_get_shadow_mode(base) == RSE::LIGHT_OMNI_SHADOW_CUBE) {
-				render_texture = light_storage->get_cubemap(shadow_size / 2);
-				render_fb = light_storage->get_cubemap_fb(shadow_size / 2, p_pass);
+				// As in Forward+.
+				const uint32_t cube_size = is_line ? shadow_size : shadow_size / 2;
+				render_texture = light_storage->get_cubemap(cube_size);
+				render_fb = light_storage->get_cubemap_fb(cube_size, p_pass);
 
 				light_projection = light_storage->light_instance_get_shadow_camera(p_light, p_pass);
 				light_transform = light_storage->light_instance_get_shadow_transform(p_light, p_pass);

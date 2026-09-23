@@ -6,8 +6,10 @@
 
 // Texels of depth error still counted as the receiver's own surface.
 #define LINE_SHADOW_PLANE_TEXELS 1.5
-// Neighbouring depths within this many texels are joined into one surface.
-#define LINE_SHADOW_CONTINUITY 6.0
+// How far off straight a block's pieces may bend and still be marked as a whole.
+#define LINE_SHADOW_MARK_TEXELS 1.5
+// Smaller maps gain nothing from it.
+#define LINE_SHADOW_PIECES_MIN_SIZE 1024
 
 struct LineShadowContext {
 	vec3 receiver; // Shadow-local: the segment runs along +Z, centered on the origin.
@@ -20,6 +22,12 @@ struct LineShadowContext {
 	uint section_base; // First per-viewpoint record in the line light array.
 	uint sections; // How many viewpoints.
 	float seg_length;
+	// Blocks whose patch at their nearest depth projects onto fewer cells than this are
+	// marked as that patch instead of being walked. It fills gaps in blockers, so it is
+	// only for receivers too coarse to show them, such as fog cells; 0 walks everything.
+	float coarse_cells;
+	// Scales the distance within which viewpoints judge alike; above 1 uses fewer.
+	float reach_scale;
 };
 
 // Interleaved gradient noise, as quick_hash() in the forward pass.
@@ -35,6 +43,8 @@ LineShadowContext line_shadow_begin(uint idx, vec3 vertex, vec3 normal, float ta
 	ctx.section_base = uint(line_lights.data[idx].pad[0]);
 	ctx.sections = max(uint(line_lights.data[idx].pad[1]), 1u);
 	ctx.seg_length = length(line_lights.data[idx].area_width);
+	ctx.coarse_cells = 0.0;
+	ctx.reach_scale = 1.0;
 	ctx.z_far = 1.0 / max(line_lights.data[idx].cone_attenuation, 1e-9);
 	ctx.receiver = (line_lights.data[idx].shadow_matrix * vec4(vertex, 1.0)).xyz;
 	ctx.normal = normalize(mat3(line_lights.data[idx].shadow_matrix) * normal);
@@ -59,6 +69,12 @@ uvec4 line_shadow_contact_cells(uint hits, float jitter) {
 	}
 	return cells;
 }
+
+#ifdef LINE_SHADOW_BLOCKER
+// Sum of (blocker's distance from the line / receiver's) over newly hidden diffuse cells,
+// and their count: how far the penumbra spreads (screen-space pass only).
+vec2 line_shadow_blocker;
+#endif
 
 // Marks the cells the surface piece from `a` to `b` hides. Slice coordinates relative to
 // the viewpoint: x from the line, y along it. `ha`, `hb` are heights above the
@@ -96,8 +112,25 @@ void _line_shadow_segment(vec2 a, vec2 b, float ha, float hb, vec3 rv, LineShado
 	float e1 = rv.y + (p1.y - rv.y) * rv.x / (rv.x - p1.x) + rv.z;
 	float u0 = min(e0, e1);
 	float u1 = max(e0, e1);
-	md |= line_shadow_cell_bits(cd, u0, u1);
+	uvec2 bits = line_shadow_cell_bits(cd, u0, u1);
+#ifdef LINE_SHADOW_BLOCKER
+	uvec2 fresh = bits & ~md;
+	float n = float(bitCount(fresh.x) + bitCount(fresh.y));
+	line_shadow_blocker += n * vec2(0.5 * (p0.x + p1.x) / rv.x, 1.0);
+#endif
+	md |= bits;
 	ms |= line_shadow_cell_bits(cs, u0, u1);
+}
+
+// Texel `j` as the leaves see it: (point, height above the receiver's plane, depth or 0).
+vec4 _line_shadow_texel(LineShadowContext ctx, ivec2 origin, int j, float delta, vec2 n2, float h0, float tol_scale) {
+	float stored = texelFetch(sampler2D(shadow_atlas, SAMPLER_NEAREST_CLAMP), origin + ivec2(j, 0), 0).r;
+	float theta = (float(j) + 0.5) * delta;
+	vec2 dir = vec2(sin(theta), cos(theta));
+	float depth = (1.0 - stored) * ctx.z_far;
+	vec2 x = depth * dir;
+	float nd = dot(dir, n2);
+	return vec4(x, dot(x, n2) - h0 - tol_scale * depth * sqrt(max(1.0 - nd * nd, 0.0)), stored > 0.0 ? depth : 0.0);
 }
 
 // Distance along the ray at `theta` from the viewpoint to where it leaves the triangle
@@ -107,12 +140,18 @@ float _line_shadow_exit(vec2 r, float a, float b, float theta_r, float theta) {
 	return e * r.x / (r.x * cos(theta) - (r.y - e) * sin(theta));
 }
 
+// Where the slice point `p` projects onto the line, seen from the receiver.
+float _line_shadow_project(vec3 rv, vec2 p) {
+	return rv.y + (p.y - rv.y) * rv.x / (rv.x - p.x) + rv.z;
+}
+
 // Adds to `md`/`ms` the cells of `own_d`/`own_s` hidden in viewpoint `view`'s map.
 void _line_shadow_walk(LineShadowContext ctx, uint view, float v, LineShadowCells cd, LineShadowCells cs, uvec2 own_d, uvec2 own_s, inout uvec2 md, inout uvec2 ms) {
 	uint record = ctx.section_base + view;
 	vec4 rect = line_lights.data[record].atlas_rect;
 	ivec2 origin = ivec2(round(rect.xy / ctx.texel_size));
 	int size = int(round(rect.z / ctx.texel_size.x));
+	int atlas_size = int(round(1.0 / ctx.texel_size.x));
 	float delta = M_PI / float(size);
 
 	vec3 r = ctx.receiver - vec3(0.0, 0.0, v);
@@ -155,7 +194,7 @@ void _line_shadow_walk(LineShadowContext ctx, uint view, float v, LineShadowCell
 	vec2 rs = rv.xy;
 	float r_len = length(rs);
 	float theta_r = atan(rho_r, r.z);
-	// Even pyramid levels span 4 to 1024 texels; none may span two slots.
+	// Blocks of even levels span 4 to 1024 texels; none may span two slots.
 	int top = size >= 16 ? min(findMSB(size) - 2, 8) & ~1 : -2;
 
 	// Each step tests a block or reads a texel, which keeps divergence low.
@@ -171,25 +210,115 @@ void _line_shadow_walk(LineShadowContext ctx, uint view, float v, LineShadowCell
 	int leaf_start = 0;
 	int leaf_own_end = top < 0 ? size : 0;
 	int leaf_end = top < 0 ? size + 1 : 0;
+	// Runs over straight pieces jump from each piece's first texel to its last.
+	int split = 0;
+	int jump_at = -1;
+	int jump_to = 0;
+	bool jumped = false;
 	[[dont_unroll]] while (i < size) {
 		if (i >= leaf_end) {
 			int block = 4 << level;
-			float nearest = (1.0 - texelFetch(sampler2D(line_shadow_pyramid, SAMPLER_NEAREST_CLAMP), (origin + ivec2(i, 0)) >> (level + 2), level).r) * ctx.z_far;
+			// Negative if a row of the block has straight pieces.
+			float stored_nearest = texelFetch(sampler2D(line_shadow_pyramid, SAMPLER_NEAREST_CLAMP), (origin + ivec2(i, 0)) >> (level + 2), level).r;
+			float nearest = (1.0 - abs(stored_nearest)) * ctx.z_far;
 			// Widened by a texel for patches. The exit distance is convex along each
 			// edge, so its maximum is at an end or at the receiver.
 			float t0 = max(float(i - 1) * delta, 0.0);
 			float t1 = min(float(i + block + 1) * delta, M_PI);
-			float reach = max(_line_shadow_exit(rs, tri_a, tri_b, theta_r, t0), _line_shadow_exit(rs, tri_a, tri_b, theta_r, t1));
-			if (t0 <= theta_r && theta_r <= t1) {
+			float exit0 = _line_shadow_exit(rs, tri_a, tri_b, theta_r, t0);
+			float exit1 = _line_shadow_exit(rs, tri_a, tri_b, theta_r, t1);
+			float reach = max(exit0, exit1);
+			bool holds_receiver = t0 <= theta_r && theta_r <= t1;
+			if (holds_receiver) {
 				reach = max(reach, r_len);
 			}
+			// A block whose patch at its nearest depth projects onto only a cell or so of
+			// the segment is taken for that patch, which is most blocks near the line.
+			// Deeper texels of the block are taken for the patch too, which errs towards
+			// shadow where a blocker has gaps.
+			bool coarse = false;
+			// An edge the ray runs parallel to, or away from, gives no exit.
+			if (ctx.coarse_cells > 0.0 && !holds_receiver && exit0 > 0.0 && exit1 > 0.0 && max(exit0, exit1) < 1e8) {
+				float ea = _line_shadow_project(rv, vec2(sin(t0), cos(t0)) * min(nearest, exit0));
+				float eb = _line_shadow_project(rv, vec2(sin(t1), cos(t1)) * min(nearest, exit1));
+				float e_lo = min(ea, eb);
+				float e_hi = max(ea, eb);
+				float span = 0.0;
+				if (own_d != uvec2(0u)) {
+					span = line_shadow_cell_of(cd, e_hi) - line_shadow_cell_of(cd, e_lo);
+				}
+				if (own_s != uvec2(0u)) {
+					span = max(span, line_shadow_cell_of(cs, e_hi) - line_shadow_cell_of(cs, e_lo));
+				}
+				coarse = span < ctx.coarse_cells;
+			}
 			// Chords between neighbouring texels dip in by up to 1 - cos(delta / 2).
-			if (nearest * cos(0.5 * delta) > 1.001 * reach) {
+			bool skip = nearest * cos(0.5 * delta) > 1.001 * reach;
+			if (coarse && !skip) {
+				// The plane's tolerance widens with the patch, so a receiver's own surface
+				// seen across the block is not taken for a blocker.
+				float ta = float(i) * delta;
+				float tb = float(i + block) * delta;
+				vec2 xa = nearest * vec2(sin(ta), cos(ta));
+				vec2 xb = nearest * vec2(sin(tb), cos(tb));
+				float tol = tol_scale * float(block) * nearest;
+				_line_shadow_segment(xa, xb, dot(xa, n2) - h0 - tol, dot(xb, n2) - h0 - tol, rv, cd, cs, hd, hs);
+				if ((hd & own_d) == own_d && (hs & own_s) == own_s) {
+					break; // Everything this viewpoint answers for is already hidden.
+				}
+			}
+			if (skip || coarse) {
 				i += block;
 				prev_ok = false;
 				// Back up to the coarsest level this block boundary starts.
 				while (level < top && (i & ((16 << level) - 1)) == 0) {
 					level += 2;
+				}
+			} else if (level > 0 && size >= LINE_SHADOW_PIECES_MIN_SIZE) {
+				uint code = stored_nearest < 0.0 ? uint(texelFetch(sampler2D(line_shadow_pyramid, SAMPLER_NEAREST_CLAMP), line_shadow_row_texel(origin.x, origin.y, size, level, i / block, atlas_size), 0).r) : 0u;
+				int k = code >= 32u ? int(code >> 4u) - 2 : block - 1;
+				// Its end texels are walked if each piece is, by its bend and half a texel,
+				// either past the receiver's plane or side, or clear of both: then its
+				// chord hides what its texels do.
+				float bend = float(code & 15u) * 0.25 * delta;
+				// A second piece that is not there stays past.
+				bvec2 past = bvec2(true);
+				bvec2 beyond = bvec2(true);
+				bvec2 clear = bvec2(bend <= LINE_SHADOW_MARK_TEXELS * delta);
+				// The leaves' tolerance vanishes along the plane's normal.
+				float first_side = 0.0;
+				bvec2 first_past = bvec2(false);
+				[[dont_unroll]] for (int e = 0; e < (code == 0u ? 0 : (code < 32u ? 2 : 4)); e++) {
+					vec4 p = _line_shadow_texel(ctx, origin, e == 0 ? i : (e == 1 ? i + k : (e == 2 ? i + k + 1 : i + block - 1)), delta, n2, h0, tol_scale);
+					float margin = (bend + 0.5 * delta) * p.w;
+					float g = 0.999 * rho_r - p.x;
+					float side = p.x * n2.y - p.y * n2.x;
+					bvec2 is_past_both = bvec2(p.z < -margin, dot(p.xy, n2) - h0 < -margin);
+					bool piece_b = e >= 2;
+					bool is_past = side * first_side < 0.0 ? first_past.y && is_past_both.y : first_past.x && is_past_both.x;
+					if ((e & 1) == 0) {
+						first_side = side;
+						first_past = is_past_both;
+						is_past = true;
+					}
+					bool is_beyond = g < -margin;
+					bool is_clear = p.z > margin && g > margin;
+					past = piece_b ? bvec2(past.x, past.y && is_past) : bvec2(past.x && is_past, past.y);
+					beyond = piece_b ? bvec2(beyond.x, beyond.y && is_beyond) : bvec2(beyond.x && is_beyond, beyond.y);
+					clear = piece_b ? bvec2(clear.x, clear.y && is_clear) : bvec2(clear.x && is_clear, clear.y);
+				}
+				if (code > 0u && all(bvec2(past.x || beyond.x || clear.x, past.y || beyond.y || clear.y))) {
+					leaf_start = i;
+					leaf_own_end = i + block;
+					leaf_end = i + block + 1;
+					// A piece of one texel has nothing to jump over.
+					split = k;
+					jump_at = k > 0 ? i : (k + 1 < block - 1 ? i + k + 1 : -1);
+					jump_to = k > 0 ? i + k : i + block - 1;
+					i = max(i - 1, 0);
+					prev_ok = false;
+				} else {
+					level -= 2;
 				}
 			} else if (level > 0) {
 				level -= 2;
@@ -197,6 +326,7 @@ void _line_shadow_walk(LineShadowContext ctx, uint view, float v, LineShadowCell
 				leaf_start = i;
 				leaf_own_end = i + 4;
 				leaf_end = i + 5;
+				jump_at = -1;
 				i = max(i - 1, 0);
 				prev_ok = false;
 			}
@@ -214,7 +344,7 @@ void _line_shadow_walk(LineShadowContext ctx, uint view, float v, LineShadowCell
 			// The texel's own patch, then the gap to its neighbour if joined.
 			vec2 t = vec2(dir.y, -dir.x) * (depth * half_tan);
 			float ht = dot(t, n2);
-			bool joined = prev_ok && abs(depth - prev_depth) <= cont_scale * min(depth, prev_depth);
+			bool joined = prev_ok && (jumped || abs(depth - prev_depth) <= cont_scale * min(depth, prev_depth));
 			bool own = i >= leaf_start && i < leaf_own_end;
 			[[dont_unroll]] for (int e = own ? 0 : 1; e < (joined ? 2 : 1); e++) {
 				_line_shadow_segment(e == 0 ? x - t : prev_x, e == 0 ? x + t : x, e == 0 ? h - ht : prev_h, e == 0 ? h + ht : h, rv, cd, cs, hd, hs);
@@ -226,7 +356,15 @@ void _line_shadow_walk(LineShadowContext ctx, uint view, float v, LineShadowCell
 		} else {
 			prev_ok = false; // Nothing recorded.
 		}
-		i++;
+		jumped = i == jump_at;
+		if (jumped) {
+			bool to_second = i == leaf_start && leaf_start + split + 1 < leaf_own_end - 1;
+			i = jump_to;
+			jump_at = to_second ? leaf_start + split + 1 : -1;
+			jump_to = leaf_own_end - 1;
+		} else {
+			i++;
+		}
 		if (i == leaf_end) {
 			i = leaf_own_end;
 			leaf_end = i;
@@ -266,7 +404,7 @@ void line_shadow_mask(LineShadowContext ctx, LineShadowCells cd, LineShadowCells
 	uint stride = 1u;
 	uint first = 0u;
 	if (ctx.sections > 2u) {
-		float reach = length(ctx.receiver.xy) / 3.0;
+		float reach = ctx.reach_scale * length(ctx.receiver.xy) / 3.0;
 		uint middle = (ctx.sections - 1u) / 2u;
 		float middle_reach = 0.5 * ctx.seg_length + abs(float(middle) * spacing - 0.5 * ctx.seg_length);
 		if (log2(max(reach / middle_reach, 1e-6)) >= ctx.stride_jitter && line_lights.data[ctx.section_base + middle].atlas_rect.z > 0.0) {
@@ -345,7 +483,18 @@ void line_shadow_visibility(uint idx, LineShadowContext ctx, vec3 normal, vec3 e
 	}
 	if ((md | ms) == uvec2(0u)) {
 		r_vis_diffuse = half(1.0);
-		r_vis_specular = half(1.0);
+		// A lobe with no weight keeps the caller's visibility, as it does below.
+		r_vis_specular = do_diffuse || do_specular ? half(1.0) : r_vis_specular;
+		return;
+	}
+	// Nothing visible: every cell below would count as lost, as long as one of them has
+	// weight at all. Cells run along the line in order and the weight's sign follows a
+	// plane, so the outermost two decide.
+	if (do_diffuse && md == uvec2(0xFFFFFFFFu) && (!do_specular || ms == uvec2(0xFFFFFFFFu)) &&
+			max(dot(normal, po_w + wt * (line_shadow_cell_u(cd, 0.0) + l_center)),
+					dot(normal, po_w + wt * (line_shadow_cell_u(cd, float(LINE_SHADOW_CELLS - 1u)) + l_center))) > 0.0) {
+		r_vis_diffuse = half(1.0) - opacity;
+		r_vis_specular = half(1.0) - opacity;
 		return;
 	}
 
