@@ -213,7 +213,10 @@
 		<constant name="PARAM_CONTACT_SHADOW_BLUR" value="22" enum="Param">
 			Constant for accessing [member shadow_contact_shadows_blur].
 		</constant>
-		<constant name="PARAM_MAX" value="23" enum="Param">
+		<constant name="PARAM_LINE_SHADOW_HEMISPHERE_ANGLE" value="23" enum="Param">
+			Constant for accessing [member LineLight3D.line_shadow_hemisphere_angle].
+		</constant>
+		<constant name="PARAM_MAX" value="24" enum="Param">
 			Represents the size of the [enum Param] enum.
 		</constant>
 		<constant name="BAKE_DISABLED" value="0" enum="BakeMode">

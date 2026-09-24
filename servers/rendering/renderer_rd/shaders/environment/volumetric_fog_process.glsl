@@ -778,7 +778,11 @@ void main() {
 					vec3 light_vec = safe_normalize(closest_point);
 
 					float shadow_attenuation = 1.0;
-					if (line_lights.data[light_index].shadow_opacity > 0.001 && dot(light_vec, light_vec) > 0.0) {
+					if (line_lights.data[light_index].shadow_opacity > 0.001 && line_lights.data[light_index].area_height.x != 0.0 && dot(light_vec, light_vec) > 0.0) {
+						// Few taps: a fog cell cannot show finer than itself.
+						float unused_blur;
+						shadow_attenuation = line_shadow_simplified(light_index, view_pos, light_vec, params.use_temporal_reprojection ? float(params.line_shadow_frame % 1024u) : 0.0, vec2(pos.xy) + float(pos.z) * vec2(17.0, 31.0), 4u, params.shadow_atlas_pixel_size, unused_blur);
+					} else if (line_lights.data[light_index].shadow_opacity > 0.001 && dot(light_vec, light_vec) > 0.0) {
 						int layer = abs(int(line_lights.data[light_index].cone_angle)) - 1;
 						uint flags = layer >= 0 && layer < LINE_FOG_LAYERS ? params.line_shadow_flags[layer / 4][layer % 4] : 0u;
 						float hidden_fraction = 0.0;

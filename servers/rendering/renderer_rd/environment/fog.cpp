@@ -1199,7 +1199,8 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 		static_assert(VolumetricFog::LINE_SHADOW_LAYERS == RendererRD::LightStorage::LINE_SCREEN_SHADOWS_MAX);
 		uint32_t layer_count = 0;
 		const bool *unused_contact = nullptr;
-		light_storage->get_line_screen_shadows(layer_count, unused_contact);
+		const bool *unused_walk = nullptr;
+		light_storage->get_line_screen_shadows(layer_count, unused_contact, unused_walk);
 		const RendererRD::LightStorage::LineScreenShadowState *states = light_storage->get_line_screen_shadow_states();
 		auto &history = fog->line_shadow_history;
 		const bool cache = params.use_temporal_reprojection && fog->line_shadow_cached;

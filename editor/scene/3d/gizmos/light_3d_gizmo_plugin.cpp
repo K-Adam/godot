@@ -456,6 +456,22 @@ void Light3DGizmoPlugin::redraw(EditorNode3DGizmo *p_gizmo) {
 
 			Vector<Vector3> handles = { Vector3(half_length, 0, 0) };
 			p_gizmo->add_handles(handles, get_material("handles"));
+
+			// The simplified shadow's caster cone: pointed the wrong way, shadows vanish.
+			const float hemisphere_angle = ll->get_param(Light3D::PARAM_LINE_SHADOW_HEMISPHERE_ANGLE);
+			if (!Math::is_zero_approx(hemisphere_angle)) {
+				const float apex = hemisphere_angle < 0 ? -half_length : half_length;
+				const float reach = ll->get_param(Light3D::PARAM_RANGE);
+				const float along = Math::cos(Math::deg_to_rad(hemisphere_angle)) * (hemisphere_angle < 0 ? -1.0 : 1.0);
+				const float across = Math::sin(Math::deg_to_rad(Math::abs(hemisphere_angle)));
+				Vector<Vector3> cone;
+				for (int i = 0; i < 8; i++) {
+					const float phi = Math::deg_to_rad(float(i) * 45.0);
+					cone.push_back(Vector3(apex, 0, 0));
+					cone.push_back(Vector3(apex, 0, 0) + Vector3(along, across * Math::cos(phi), across * Math::sin(phi)) * reach);
+				}
+				p_gizmo->add_lines(cone, get_material("lines_secondary", p_gizmo), false, color);
+			}
 		}
 
 		const Ref<Material> icon = get_material("light_line_icon", p_gizmo);

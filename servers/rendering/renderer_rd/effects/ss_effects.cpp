@@ -375,13 +375,14 @@ SSEffects::SSEffects() {
 #ifdef REAL_T_IS_DOUBLE
 			shadows_defines += "\n#define USE_DOUBLE_PRECISION\n";
 #endif
-			sscs.shadows_shader.initialize(Vector<String>{ "\n#define MODE_WALK\n", "\n#define MODE_FILTER\n", "\n#define MODE_PENUMBRA\n", "\n#define MODE_RECORD\n", "\n#define MODE_CLASSIFY\n" }, shadows_defines);
+			sscs.shadows_shader.initialize(Vector<String>{ "\n#define MODE_WALK\n", "\n#define MODE_FILTER\n", "\n#define MODE_PENUMBRA\n", "\n#define MODE_RECORD\n", "\n#define MODE_CLASSIFY\n", "\n#define MODE_SIMPLE\n" }, shadows_defines);
 			sscs.shadows_shader_version = sscs.shadows_shader.version_create();
 			sscs.shadows_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 0));
 			sscs.shadows_filter_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 1));
 			sscs.shadows_penumbra_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 2));
 			sscs.shadows_record_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 3));
 			sscs.shadows_classify_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 4));
+			sscs.shadows_simple_pipeline.create_compute_pipeline(sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 5));
 		}
 	}
 
@@ -2099,11 +2100,14 @@ void SSEffects::line_light_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, c
 	RID penumbra_shader = sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 2);
 	RID record_shader = sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 3);
 	RID classify_shader = sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 4);
+	RID simple_shader = sscs.shadows_shader.version_get_shader(sscs.shadows_shader_version, 5);
 	RID nearest = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 	RID linear = material_storage->sampler_rd_get_default(RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED);
 	RD::Uniform u_lights(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, p_params.line_light_buffer);
 	RD::Uniform u_atlas(RD::UNIFORM_TYPE_TEXTURE, 5, p_params.shadow_atlas);
-	RD::Uniform u_pyramid(RD::UNIFORM_TYPE_TEXTURE, 6, p_params.line_pyramid);
+	// Only simplified lights run without a pyramid, and they never read it.
+	RD::Uniform u_pyramid(RD::UNIFORM_TYPE_TEXTURE, 6, p_params.line_pyramid.is_valid() ? p_params.line_pyramid : texture_storage->texture_rd_get_default(TextureStorage::DEFAULT_RD_TEXTURE_BLACK));
+	RD::Uniform u_shadow_sampler(RD::UNIFORM_TYPE_SAMPLER, 21, p_params.shadow_sampler);
 	RD::Uniform u_nearest(RD::UNIFORM_TYPE_SAMPLER, 7, nearest);
 	RD::Uniform u_linear(RD::UNIFORM_TYPE_SAMPLER, 8, linear);
 	RD::Uniform u_lut1(RD::UNIFORM_TYPE_TEXTURE, 9, p_params.ltc_lut1);
@@ -2159,6 +2163,7 @@ void SSEffects::line_light_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, c
 		RD::Uniform u_previous_normal(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 16, Vector<RID>{ nearest, p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_PREVIOUS_NORMAL, v, 0) });
 
 		for (uint32_t i = 0; i < p_params.light_count; i++) {
+			const bool simple = p_params.walk && !p_params.walk[i];
 			const uint32_t layer_index = i * view_count + v;
 			RID layer = p_render_buffers->get_texture_slice(RB_SCOPE_LINE_SHADOWS, RB_LINE_VISIBILITY, layer_index, 0);
 			push_constant.light_index = p_params.lights[i];
@@ -2174,33 +2179,43 @@ void SSEffects::line_light_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, c
 			RID target = (p_params.filter_passes + 1) % 2 == 0 ? layer : temp;
 			RD::Uniform u_output(RD::UNIFORM_TYPE_IMAGE, 1, target);
 
-			// An empty list. The row width is WALK_GROUPS_PER_ROW in the shader, which
-			// fills in how many rows the walkers it lists need.
-			const uint32_t empty_count = 0;
-			const uint32_t empty_groups[3] = { 256, 0, 1 };
-			RD::get_singleton()->buffer_update(sscs.shadows_walk_list, 0, sizeof(empty_count), &empty_count);
-			RD::get_singleton()->buffer_update(sscs.shadows_walk_args, 0, sizeof(empty_groups), empty_groups);
-			RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
-			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_classify_pipeline.get_rid());
-			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(classify_shader, 0, u_depth, u_output, u_lights, u_normal, u_raw, u_scene, u_history, u_previous_z, u_current_z, u_current_normal, u_previous_normal, u_count, u_previous_count, u_walk_list, u_walk_args), 0);
-			RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
-			RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
-			RD::get_singleton()->compute_list_end();
+			if (simple) {
+				RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
+				RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_simple_pipeline.get_rid());
+				RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(simple_shader, 0, u_depth, u_output, u_lights, u_normal, u_raw, u_atlas, u_pyramid, u_nearest, u_linear, u_lut1, u_lut2, u_scene, u_count, u_walk_list, u_shadow_sampler), 0);
+				RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+				RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+				RD::get_singleton()->compute_list_end();
+			} else {
+				// An empty list. The row width is WALK_GROUPS_PER_ROW in the shader, which
+				// fills in how many rows the walkers it lists need.
+				const uint32_t empty_count = 0;
+				const uint32_t empty_groups[3] = { 256, 0, 1 };
+				RD::get_singleton()->buffer_update(sscs.shadows_walk_list, 0, sizeof(empty_count), &empty_count);
+				RD::get_singleton()->buffer_update(sscs.shadows_walk_args, 0, sizeof(empty_groups), empty_groups);
+				RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
+				RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_classify_pipeline.get_rid());
+				RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(classify_shader, 0, u_depth, u_output, u_lights, u_normal, u_raw, u_scene, u_history, u_previous_z, u_current_z, u_current_normal, u_previous_normal, u_count, u_previous_count, u_walk_list, u_walk_args), 0);
+				RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+				RD::get_singleton()->compute_list_dispatch_threads(compute_list, size.width, size.height, 1);
+				RD::get_singleton()->compute_list_end();
 
-			// Only the listed pixels walk, packed so a warp holds 64 of them.
-			compute_list = RD::get_singleton()->compute_list_begin();
-			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_pipeline.get_rid());
-			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(shader, 0, u_depth, u_output, u_lights, u_normal, u_raw, u_atlas, u_pyramid, u_nearest, u_linear, u_lut1, u_lut2, u_scene, u_count, u_walk_list), 0);
-			RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
-			RD::get_singleton()->compute_list_dispatch_indirect(compute_list, sscs.shadows_walk_args, 0);
-			RD::get_singleton()->compute_list_end();
+				// Only the listed pixels walk, packed so a warp holds 64 of them.
+				compute_list = RD::get_singleton()->compute_list_begin();
+				RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_pipeline.get_rid());
+				RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(shader, 0, u_depth, u_output, u_lights, u_normal, u_raw, u_atlas, u_pyramid, u_nearest, u_linear, u_lut1, u_lut2, u_scene, u_count, u_walk_list), 0);
+				RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
+				RD::get_singleton()->compute_list_dispatch_indirect(compute_list, sscs.shadows_walk_args, 0);
+				RD::get_singleton()->compute_list_end();
 
-			if (temporal_frames > 0) {
-				// Unfiltered, so the filter runs over each frame's result once.
-				const bool in_layer = target == layer;
-				RD::get_singleton()->texture_copy(p_render_buffers->get_texture(RB_SCOPE_LINE_SHADOWS, in_layer ? RB_LINE_VISIBILITY : RB_LINE_VISIBILITY_TEMP), history_texture,
-						Vector3(), Vector3(), Vector3(size.width, size.height, 1), 0, 0, in_layer ? layer_index : v, layer_index);
-				RD::get_singleton()->texture_copy(count_texture, previous_count_texture, Vector3(), Vector3(), Vector3(size.width, size.height, 1), 0, 0, layer_index, layer_index);
+				if (temporal_frames > 0) {
+					// Unfiltered, so the filter runs over each frame's result once.
+					const bool in_layer = target == layer;
+					RD::get_singleton()->texture_copy(p_render_buffers->get_texture(RB_SCOPE_LINE_SHADOWS, in_layer ? RB_LINE_VISIBILITY : RB_LINE_VISIBILITY_TEMP), history_texture,
+							Vector3(), Vector3(), Vector3(size.width, size.height, 1), 0, 0, in_layer ? layer_index : v, layer_index);
+					RD::get_singleton()->texture_copy(count_texture, previous_count_texture, Vector3(), Vector3(), Vector3(size.width, size.height, 1), 0, 0, layer_index, layer_index);
+				}
+
 			}
 
 			for (int pass = 0; pass < p_params.filter_passes; pass++) {
@@ -2209,7 +2224,7 @@ void SSEffects::line_light_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, c
 				push_constant.tap_step = 1 << pass;
 				RD::Uniform u_source(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>{ nearest, source });
 				RD::Uniform u_target(RD::UNIFORM_TYPE_IMAGE, 1, target);
-				compute_list = RD::get_singleton()->compute_list_begin();
+				RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 				RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_filter_pipeline.get_rid());
 				RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(filter_shader, 0, u_depth, u_target, u_normal, u_source, u_scene), 0);
 				RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));
@@ -2222,7 +2237,7 @@ void SSEffects::line_light_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, c
 				target = target == layer ? temp : layer;
 				RD::Uniform u_source(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>{ nearest, source });
 				RD::Uniform u_target(RD::UNIFORM_TYPE_IMAGE, 1, target);
-				compute_list = RD::get_singleton()->compute_list_begin();
+				RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 				RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, sscs.shadows_penumbra_pipeline.get_rid());
 				RD::get_singleton()->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(penumbra_shader, 0, u_depth, u_target, u_lights, u_normal, u_source, u_scene), 0);
 				RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(push_constant));

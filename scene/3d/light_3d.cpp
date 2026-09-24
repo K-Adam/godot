@@ -43,7 +43,7 @@ void Light3D::set_param(Param p_param, real_t p_value) {
 
 	RS::get_singleton()->light_set_param(light, RSE::LightParam(p_param), p_value);
 
-	if (p_param == PARAM_SPOT_ANGLE || p_param == PARAM_RANGE) {
+	if (p_param == PARAM_SPOT_ANGLE || p_param == PARAM_RANGE || p_param == PARAM_LINE_SHADOW_HEMISPHERE_ANGLE) {
 		update_gizmos();
 
 		if (p_param == PARAM_SPOT_ANGLE) {
@@ -486,6 +486,7 @@ void Light3D::_bind_methods() {
 	BIND_ENUM_CONSTANT(PARAM_INTENSITY);
 	BIND_ENUM_CONSTANT(PARAM_CONTACT_SHADOW_OPACITY);
 	BIND_ENUM_CONSTANT(PARAM_CONTACT_SHADOW_BLUR);
+	BIND_ENUM_CONSTANT(PARAM_LINE_SHADOW_HEMISPHERE_ANGLE);
 	BIND_ENUM_CONSTANT(PARAM_MAX);
 
 	BIND_ENUM_CONSTANT(BAKE_DISABLED);
@@ -545,6 +546,7 @@ Light3D::Light3D(RSE::LightType p_type) {
 	set_param(PARAM_SHADOW_FADE_START, 1);
 	set_param(PARAM_CONTACT_SHADOW_OPACITY, 1.0);
 	set_param(PARAM_CONTACT_SHADOW_BLUR, 1.0);
+	set_param(PARAM_LINE_SHADOW_HEMISPHERE_ANGLE, 0.0);
 	// For OmniLight3D and SpotLight3D, specified in Lumens.
 	set_param(PARAM_INTENSITY, 1000.0);
 	set_temperature(6500.0); // Nearly white.
@@ -887,4 +889,7 @@ void LineLight3D::_bind_methods() {
 	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "line_attenuation", PROPERTY_HINT_RANGE, "-10,10,0.001,or_greater,or_less"), "set_param", "get_param", PARAM_ATTENUATION);
 	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "line_radius", PROPERTY_HINT_RANGE, "0.001,1,0.001,or_greater,suffix:m"), "set_param", "get_param", PARAM_SIZE);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "line_normalize_energy"), "set_line_normalize_energy", "is_line_normalizing_energy");
+
+	ADD_GROUP("Line Shadow", "line_shadow_");
+	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "line_shadow_hemisphere_angle", PROPERTY_HINT_RANGE, "-90,90,0.1,degrees"), "set_param", "get_param", PARAM_LINE_SHADOW_HEMISPHERE_ANGLE);
 }

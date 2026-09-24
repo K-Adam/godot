@@ -203,6 +203,7 @@ public:
 	struct LineShadowParams {
 		const uint32_t *lights = nullptr; // Line light buffer indices; one layer each per view.
 		const bool *contact = nullptr; // Per light: whether to march contact shadows.
+		const bool *walk = nullptr; // Per light: whether it needs the shadow map walk at all.
 		bool keep_raw_contact = false; // Keep each light's unfiltered hits for line_light_shadows().
 		uint32_t light_count = 0;
 		const Projection *projections = nullptr;
@@ -216,6 +217,7 @@ public:
 		RID scene_data;
 		RID shadow_atlas;
 		RID line_pyramid;
+		RID shadow_sampler; // Comparison sampler for lights without the walk.
 		RID ltc_lut1;
 		RID ltc_lut2;
 		int filter_passes = 1;
@@ -596,6 +598,7 @@ private:
 		PipelineDeferredRD shadows_penumbra_pipeline;
 		PipelineDeferredRD shadows_record_pipeline;
 		PipelineDeferredRD shadows_classify_pipeline;
+		PipelineDeferredRD shadows_simple_pipeline;
 		// The pixels MODE_CLASSIFY hands to the walk, and the walk's dispatch size.
 		RID shadows_walk_list;
 		RID shadows_walk_args;

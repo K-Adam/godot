@@ -1484,27 +1484,65 @@ void light_process_line(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, hvec
 #ifndef SHADOWS_DISABLED
 	bool shadow_walk = line_lights.data[idx].shadow_opacity > 0.001;
 	bool walk_diffuse = true;
+	bool simplified = line_lights.data[idx].area_height.x != 0.0;
+	int pass_layer = -1;
 // The pass shaded the prepass depth: not the surface of materials that move it.
 #if defined(USE_LINE_SHADOW_PASS) && !defined(LIGHT_VERTEX_USED) && !defined(DEPTH_USED) && !defined(Z_CLIP_SCALE_USED)
-	// Screen-space layer + 1, negative without contact shadows.
-	int layer = abs(int(line_lights.data[idx].cone_angle));
-	bool pass_match = line_shadow_pass_match;
-	if (pass_match && bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_LINE_SHADOW_PASS_CHECK_SURFACE)) {
-		// Where surfaces meet their depths agree, but not their normals.
+	{
+		// Screen-space layer + 1, negative without contact shadows.
+		int layer = abs(int(line_lights.data[idx].cone_angle));
+		bool pass_match = line_shadow_pass_match;
+		if (pass_match && bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_LINE_SHADOW_PASS_CHECK_SURFACE)) {
+			// Where surfaces meet their depths agree, but not their normals.
 #ifdef USE_MULTIVIEW
-		vec3 pass_normal = texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(gl_FragCoord.xy, ViewIndex), 0).xyz;
+			vec3 pass_normal = texelFetch(sampler2DArray(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec3(gl_FragCoord.xy, ViewIndex), 0).xyz;
 #else
-		vec3 pass_normal = texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec2(gl_FragCoord.xy), 0).xyz;
+			vec3 pass_normal = texelFetch(sampler2D(normal_roughness_buffer, SAMPLER_NEAREST_CLAMP), ivec2(gl_FragCoord.xy), 0).xyz;
 #endif
-		pass_match = dot(normalize(pass_normal * 2.0 - 1.0), vec3(normal)) > 0.9;
+			pass_match = dot(normalize(pass_normal * 2.0 - 1.0), vec3(normal)) > 0.9;
+		}
+		if (layer > 0 && pass_match && bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_LINE_SHADOW_PASS)) {
+#ifdef USE_MULTIVIEW
+			pass_layer = (layer - 1) * 2 + int(ViewIndex);
+#else
+			pass_layer = layer - 1;
+#endif
+		}
 	}
-	if (shadow_walk && layer > 0 && pass_match && bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_LINE_SHADOW_PASS)) {
-#ifdef USE_MULTIVIEW
-		layer = (layer - 1) * 2 + int(ViewIndex);
-#else
-		layer -= 1;
 #endif
-		vec2 vis = texelFetch(sampler2DArray(line_shadow_pass_buffer, SAMPLER_NEAREST_CLAMP), ivec3(gl_FragCoord.xy, layer), 0).rg;
+	if (simplified) {
+		shadow_walk = false;
+		if (line_lights.data[idx].shadow_opacity > 0.001) {
+			float vis;
+#if defined(USE_LINE_SHADOW_PASS) && !defined(LIGHT_VERTEX_USED) && !defined(DEPTH_USED) && !defined(Z_CLIP_SCALE_USED)
+			if (pass_layer >= 0) {
+				vis = texelFetch(sampler2DArray(line_shadow_pass_buffer, SAMPLER_NEAREST_CLAMP), ivec3(gl_FragCoord.xy, pass_layer), 0).r;
+			} else
+#endif
+			{
+				float unused_blur;
+				vis = line_shadow_simplified(idx, vertex, vec3(normal), taa_frame_count, gl_FragCoord.xy, max(sc_penumbra_shadow_samples(), 4u), scene_data_block.data.shadow_atlas_pixel_size, unused_blur);
+			}
+#ifdef USE_LINE_CONTACT_SHADOWS
+			int simple_contact = int(line_lights.data[idx].cone_angle);
+			if (simple_contact > 0 && bool(implementation_data.ss_effects_flags & SCREEN_SPACE_EFFECTS_FLAGS_USE_LINE_SSCS)) {
+#ifdef USE_MULTIVIEW
+				simple_contact = (simple_contact - 1) * 2 + int(ViewIndex);
+#else
+				simple_contact -= 1;
+#endif
+				// Four bits of hits per quarter of the segment.
+				uint hits = uint(texelFetch(sampler2DArray(line_contact_shadows, SAMPLER_NEAREST_CLAMP), ivec3(gl_FragCoord.xy, simple_contact), 0).r * 65535.0 + 0.5);
+				float hidden = float((hits & 15u) + ((hits >> 4u) & 15u) + ((hits >> 8u) & 15u) + ((hits >> 12u) & 15u)) / 60.0;
+				vis *= 1.0 - hidden * line_lights.data[idx].shadow_opacity;
+			}
+#endif
+			vis_diffuse = half(vis);
+			vis_specular = vis_diffuse;
+		}
+	} else if (shadow_walk && pass_layer >= 0) {
+#if defined(USE_LINE_SHADOW_PASS) && !defined(LIGHT_VERTEX_USED) && !defined(DEPTH_USED) && !defined(Z_CLIP_SCALE_USED)
+		vec2 vis = texelFetch(sampler2DArray(line_shadow_pass_buffer, SAMPLER_NEAREST_CLAMP), ivec3(gl_FragCoord.xy, pass_layer), 0).rg;
 		vis_diffuse = half(vis.x);
 		vis_specular = half(vis.y);
 		// The G-buffer normal is too coarse for very narrow lobes.
@@ -1514,15 +1552,15 @@ void light_process_line(uint idx, vec3 vertex, hvec3 eye_vec, hvec3 normal, hvec
 #else
 		shadow_walk = float(roughness) * float(roughness) < LINE_SHADOW_PASS_MIN_ALPHA;
 #endif
+#endif
 	}
-#ifndef LIGHT_ANISOTROPY_USED
-	// Every shadowed line light has a layer and every fragment is the pass's surface:
-	// the walk below is compiled out, which keeps the whole shader lighter. Curved
-	// mirrors then take the pass's specular visibility too.
+#if defined(USE_LINE_SHADOW_PASS) && !defined(LIGHT_VERTEX_USED) && !defined(DEPTH_USED) && !defined(Z_CLIP_SCALE_USED) && !defined(LIGHT_ANISOTROPY_USED)
+	// Every shadowed line light has a layer and every fragment is the pass's
+	// surface: the walk below is compiled out, which keeps the whole shader
+	// lighter. Curved mirrors then take the pass's specular visibility too.
 	if (sc_line_shadow_pass_only()) {
 		shadow_walk = false;
 	}
-#endif
 #endif
 	if (shadow_walk) {
 		LineShadowContext ctx = line_shadow_begin(idx, vertex, vec3(normal), taa_frame_count, gl_FragCoord.xy, scene_data_block.data.shadow_atlas_pixel_size);

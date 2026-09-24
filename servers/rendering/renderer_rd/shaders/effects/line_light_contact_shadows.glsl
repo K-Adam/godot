@@ -152,6 +152,13 @@ void main() {
 		float tolerance = depth_slope(pixel, vertex.z, inv_projection) + 0.001 * -vertex.z;
 		// A texel of the polar shadow map spans pi / size radians.
 		float reach = REACH_TEXELS * closest * 3.14159265 / max(light.atlas_rect.z * params.shadow_atlas_size, 1.0);
+		float max_pixels = params.max_pixels;
+		if (light.area_height.x != 0.0) {
+			// The simplified map, seen from the segment's middle, loses blockers hidden behind
+			// higher ones; these rays follow the true rays, so they reach further.
+			reach = 0.1 * closest;
+			max_pixels *= 2.0;
+		}
 
 		for (uint k = 0u; k < STRATA; k++) {
 			float u = line_shadow_cell_u(cells, (float(k) + stratum_jitter) * float(LINE_SHADOW_CELLS / STRATA));
@@ -170,7 +177,7 @@ void main() {
 				continue;
 			}
 			float pixels_per_unit = length((b.xy / b.w - a.xy / a.w) * 0.5 * screen) / probe;
-			float march = min(min(params.max_pixels / max(pixels_per_unit, 1e-6), 0.8 * ray_length), reach);
+			float march = min(min(max_pixels / max(pixels_per_unit, 1e-6), 0.8 * ray_length), reach);
 
 			float pixels = march * pixels_per_unit;
 			if (pixels < 1.0) {

@@ -48,7 +48,7 @@ namespace GLES3 {
 
 struct Light {
 	RSE::LightType type;
-	float param[RSE::LIGHT_PARAM_MAX];
+	float param[RSE::LIGHT_PARAM_MAX] = {};
 	Color color = Color(1, 1, 1, 1);
 	RID projector;
 	bool shadow = false;

@@ -2701,6 +2701,10 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 			// Rendered as six perspective faces, then resolved into the polar layout
 			// the shader walks. Every backend that shadows line lights renders cubes.
 			const bool cube = RSG::light_storage->light_instances_can_render_shadow_cube();
+			// The simplified mode resolves this one viewpoint into a hemisphere. Faces no
+			// caster can reach are still drawn, empty, so the cube stays cleared.
+			const float hemisphere_angle = RSG::light_storage->light_get_param(p_instance->base, RSE::LIGHT_PARAM_LINE_SHADOW_HEMISPHERE_ANGLE);
+			const bool simplified = cube && RendererLightStorage::line_light_shadow_simplified(hemisphere_angle, RSG::light_storage->light_line_get_length(p_instance->base));
 			const int passes = cube ? 6 : 2;
 			if (max_shadows_used + passes > MAX_UPDATE_SHADOWS) {
 				return true;
@@ -2748,9 +2752,11 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 
 				Transform3D xform = dp_transform;
 				Vector<Plane> planes;
+				bool cull = true;
 				if (cube) {
 					xform = dp_transform * Transform3D().looking_at(view_normals[i], view_up[i]);
 					planes = cm.get_projection_planes(xform);
+					cull = !simplified || RendererLightStorage::line_light_hemisphere_face_used(i, hemisphere_angle);
 				} else {
 					real_t z = i == 0 ? -1 : 1;
 					planes.resize(6);
@@ -2764,21 +2770,23 @@ bool RendererSceneCull::_light_instance_update_shadow(Instance *p_instance, cons
 
 				instance_shadow_cull_result.clear();
 
-				Vector<Vector3> points = Geometry3D::compute_convex_mesh_points(&planes[0], planes.size());
+				if (cull) {
+					Vector<Vector3> points = Geometry3D::compute_convex_mesh_points(&planes[0], planes.size());
 
-				struct CullConvex {
-					PagedArray<Instance *> *result;
-					_FORCE_INLINE_ bool operator()(void *p_data) {
-						Instance *p_instance = (Instance *)p_data;
-						result->push_back(p_instance);
-						return false;
-					}
-				};
+					struct CullConvex {
+						PagedArray<Instance *> *result;
+						_FORCE_INLINE_ bool operator()(void *p_data) {
+							Instance *p_instance = (Instance *)p_data;
+							result->push_back(p_instance);
+							return false;
+						}
+					};
 
-				CullConvex cull_convex;
-				cull_convex.result = &instance_shadow_cull_result;
+					CullConvex cull_convex;
+					cull_convex.result = &instance_shadow_cull_result;
 
-				p_scenario->indexers[Scenario::INDEXER_GEOMETRY].convex_query(planes.ptr(), planes.size(), points.ptr(), points.size(), cull_convex);
+					p_scenario->indexers[Scenario::INDEXER_GEOMETRY].convex_query(planes.ptr(), planes.size(), points.ptr(), points.size(), cull_convex);
+				}
 
 				RendererSceneRender::RenderShadowData &shadow_data = render_shadow_data[max_shadows_used++];
 

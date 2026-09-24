@@ -172,6 +172,7 @@ void LightStorage::_light_initialize(RID p_light, RSE::LightType p_type) {
 	light.param[RSE::LIGHT_PARAM_INTENSITY] = p_type == RSE::LIGHT_DIRECTIONAL ? 100000.0 : 1000.0;
 	light.param[RSE::LIGHT_PARAM_CONTACT_SHADOW_OPACITY] = 1.0;
 	light.param[RSE::LIGHT_PARAM_CONTACT_SHADOW_BLUR] = 1.0;
+	light.param[RSE::LIGHT_PARAM_LINE_SHADOW_HEMISPHERE_ANGLE] = 0.0;
 
 	light_owner.initialize_rid(p_light, light);
 }
@@ -251,6 +252,7 @@ void LightStorage::light_set_param(RID p_light, RSE::LightParam p_param, float p
 		case RSE::LIGHT_PARAM_SHADOW_SPLIT_3_OFFSET:
 		case RSE::LIGHT_PARAM_SHADOW_NORMAL_BIAS:
 		case RSE::LIGHT_PARAM_SHADOW_PANCAKE_SIZE:
+		case RSE::LIGHT_PARAM_LINE_SHADOW_HEMISPHERE_ANGLE:
 		case RSE::LIGHT_PARAM_SHADOW_BIAS: {
 			light->version++;
 			light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT);
@@ -629,8 +631,18 @@ RID LightStorage::light_instance_create(RID p_light) {
 	return li;
 }
 
+bool LightStorage::_line_light_simplified(const Light *p_light) const {
+	// Resolved from a cube, so a backend without cubes keeps the exact path.
+	return p_light->type == RSE::LIGHT_LINE && p_light->shadow &&
+			line_light_shadow_simplified(p_light->param[RSE::LIGHT_PARAM_LINE_SHADOW_HEMISPHERE_ANGLE], p_light->line_length) &&
+			light_instances_can_render_shadow_cube();
+}
+
 uint32_t LightStorage::_line_light_shadow_sections(const Light *p_light) const {
 	if (p_light->type != RSE::LIGHT_LINE || !p_light->shadow || p_light->line_length <= 0.0) {
+		return 1;
+	}
+	if (_line_light_simplified(p_light)) {
 		return 1;
 	}
 	// Viewpoints sit at both ends and every section boundary; a very short light gets
@@ -667,6 +679,14 @@ void LightStorage::light_instance_update_shadow_sections(RID p_light_instance) {
 		section_instance->is_shadow_section = true;
 		light_instance->shadow_sections.push_back(section);
 	}
+}
+
+bool LightStorage::light_instance_is_line_shadow_simplified(RID p_light_instance) const {
+	const LightInstance *light_instance = light_instance_owner.get_or_null(p_light_instance);
+	ERR_FAIL_NULL_V(light_instance, false);
+	const Light *light = light_owner.get_or_null(light_instance->light);
+	ERR_FAIL_NULL_V(light, false);
+	return _line_light_simplified(light);
 }
 
 uint32_t LightStorage::light_instance_get_shadow_section_count(RID p_light_instance) const {
@@ -1213,7 +1233,8 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 				}
 			} else if (type == RSE::LIGHT_LINE) {
 				// The segment lies along the light's local X axis, centered on its origin.
-				// `area_width` carries the full segment vector; `area_height` is unused.
+				// `area_width` carries the full segment vector; `area_height.x` the
+				// simplified shadow's side, or zero.
 				float length = light->line_length;
 				Vector3 segment = inverse_transform.basis.xform(light_transform.basis.xform(Vector3(1, 0, 0))).normalized() * length;
 
@@ -1362,11 +1383,15 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 					light_data.direction[0] = omni_offset.x * float(rect.size.width);
 					light_data.direction[1] = omni_offset.y * float(rect.size.height);
 
+					const bool simplified = _line_light_simplified(light);
+					const float hemisphere_angle = light->param[RSE::LIGHT_PARAM_LINE_SHADOW_HEMISPHERE_ANGLE];
+					light_data.area_height[0] = simplified ? (hemisphere_angle < 0.0f ? -1.0f : 1.0f) : 0.0f;
+
 					// First per-viewpoint record and viewpoint count.
 					const uint32_t sections = light_instance_get_shadow_section_count(light_instance->self);
 					light_data.pad[0] = float(index);
 					light_data.pad[1] = 1.0;
-					if (shadow_atlas_get_line_pyramid(p_shadow_atlas).is_null()) {
+					if (!simplified && shadow_atlas_get_line_pyramid(p_shadow_atlas).is_null()) {
 						light_data.shadow_opacity = 0.0; // Not rendered yet; the shader needs the pyramid.
 					}
 
@@ -1409,7 +1434,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 						state.key = hash_djb2_one_64(light_instance->self.get_id());
 						state.key = hash_djb2_one_64(hash_murmur3_buffer(&light_transform, sizeof(Transform3D)), state.key);
 						// Only what the shadow depends on: an animated energy must not drop the history.
-						for (RSE::LightParam param : { RSE::LIGHT_PARAM_RANGE, RSE::LIGHT_PARAM_SIZE, RSE::LIGHT_PARAM_SHADOW_BIAS, RSE::LIGHT_PARAM_SHADOW_NORMAL_BIAS }) {
+						for (RSE::LightParam param : { RSE::LIGHT_PARAM_RANGE, RSE::LIGHT_PARAM_SIZE, RSE::LIGHT_PARAM_SHADOW_BIAS, RSE::LIGHT_PARAM_SHADOW_NORMAL_BIAS, RSE::LIGHT_PARAM_LINE_SHADOW_HEMISPHERE_ANGLE }) {
 							state.key = hash_djb2_one_64(hash_murmur3_one_float(light->param[param]), state.key);
 						}
 						// Includes the distance fade, and is baked into the visibility.
@@ -1429,6 +1454,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 							state.version = MAX(state.version, atlas->quadrants[(*slot >> QUADRANT_SHIFT) & 0x3].shadows[*slot & SHADOW_INDEX_MASK].version);
 						}
 						line_screen_shadow_contact[line_screen_shadow_count] = light->allow_contact_shadows;
+						line_screen_shadow_walk[line_screen_shadow_count] = !simplified;
 						line_screen_shadows[line_screen_shadow_count++] = index;
 						light_data.cos_spot_angle = light->allow_contact_shadows ? float(line_screen_shadow_count) : -float(line_screen_shadow_count);
 					}
@@ -2912,6 +2938,25 @@ bool LightStorage::shadow_atlas_update_light(RID p_atlas, RID p_light_instance, 
 	bool should_realloc = false;
 	bool should_redraw = false;
 
+	// Omni and exact line lights take two adjacent slots (paraboloid or polar halves);
+	// this drives the paired allocation and the key's `OMNI_LIGHT_FLAG`.
+	const Light *li_light = light_owner.get_or_null(li->light);
+	bool is_omni = li->light_type == RSE::LIGHT_OMNI || (li->light_type == RSE::LIGHT_LINE && !(li_light && _line_light_simplified(li_light)));
+
+	// A switch of line shadow mode changes the slot count, and a same-size reallocation
+	// is refused: start afresh.
+	const uint32_t *owned_key = shadow_atlas->shadow_owners.getptr(p_light_instance);
+	if (owned_key && bool(*owned_key & OMNI_LIGHT_FLAG) != is_omni) {
+		const uint32_t q = (*owned_key >> QUADRANT_SHIFT) & 0x3;
+		const uint32_t s = *owned_key & SHADOW_INDEX_MASK;
+		for (uint32_t i = s; i <= s + ((*owned_key & OMNI_LIGHT_FLAG) ? 1 : 0); i++) {
+			shadow_atlas->quadrants[q].shadows.write[i].owner = RID();
+			shadow_atlas->quadrants[q].shadows.write[i].version = 0;
+		}
+		shadow_atlas->shadow_owners.erase(p_light_instance);
+		li->shadow_atlases.erase(p_atlas);
+	}
+
 	if (shadow_atlas->shadow_owners.has(p_light_instance)) {
 		old_key = shadow_atlas->shadow_owners[p_light_instance];
 		old_quadrant = (old_key >> QUADRANT_SHIFT) & 0x3;
@@ -2929,9 +2974,6 @@ bool LightStorage::shadow_atlas_update_light(RID p_atlas, RID p_light_instance, 
 		old_subdivision = shadow_atlas->quadrants[old_quadrant].subdivision;
 	}
 
-	// Omni and line lights take two adjacent slots (paraboloid or polar halves); this
-	// drives the paired allocation and the key's `OMNI_LIGHT_FLAG`.
-	bool is_omni = li->light_type == RSE::LIGHT_OMNI || li->light_type == RSE::LIGHT_LINE;
 	bool found_shadow = false;
 	int new_quadrant = -1;
 	int new_shadow = -1;

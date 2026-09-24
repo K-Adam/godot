@@ -121,6 +121,23 @@ public:
 		return p_count <= 1 ? p_length * 0.5f : p_length;
 	}
 
+	// A line light's simplified shadow: one hemisphere from the middle of the segment,
+	// facing the local +X end (shadow-local +Z) when the angle is positive, -X when
+	// negative; its magnitude bounds the casters' cone. Zero keeps the exact shadow.
+	static _FORCE_INLINE_ bool line_light_shadow_simplified(float p_angle, float p_length) {
+		return !Math::is_zero_approx(p_angle) && p_length > 0.0;
+	}
+
+	// Whether cube face `p_face` can see into the casters' cone: its corners reach
+	// 54.7356 degrees off its axis.
+	static _FORCE_INLINE_ bool line_light_hemisphere_face_used(int p_face, float p_angle) {
+		// Z of each face axis, in the shadow cull's face order.
+		static const float face_z[6] = { 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, -1.0f };
+		const float dir = p_angle < 0.0f ? -1.0f : 1.0f;
+		const float limit = Math::deg_to_rad(MIN(Math::abs(p_angle), 180.0f) + 54.7356f);
+		return face_z[p_face] * dir >= Math::cos(limit);
+	}
+
 	virtual void light_instance_update_shadow_sections(RID p_light_instance) {}
 	virtual uint32_t light_instance_get_shadow_section_count(RID p_light_instance) const { return 1; }
 	virtual RID light_instance_get_shadow_section(RID p_light_instance, uint32_t p_section) const { return p_light_instance; }

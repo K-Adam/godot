@@ -151,6 +151,7 @@ private:
 	float line_shadow_section_length = 1.5;
 	uint32_t line_shadow_max_sections = 8;
 
+	bool _line_light_simplified(const Light *p_light) const;
 	uint32_t _line_light_shadow_sections(const Light *p_light) const;
 
 	mutable RID_Owner<LightInstance> light_instance_owner;
@@ -205,6 +206,8 @@ private:
 	uint32_t line_light_count = 0;
 	uint32_t line_screen_shadows[LINE_SCREEN_SHADOWS_MAX];
 	bool line_screen_shadow_contact[LINE_SCREEN_SHADOWS_MAX];
+	// False for simplified lights, which the pass samples without the walk.
+	bool line_screen_shadow_walk[LINE_SCREEN_SHADOWS_MAX];
 	// Per screen-space shadow: what its shadow looks from (instance, transform, params,
 	// atlas slots), and a value that changes whenever its maps are redrawn.
 	LineScreenShadowState line_screen_shadow_state[LINE_SCREEN_SHADOWS_MAX];
@@ -690,6 +693,7 @@ public:
 	virtual uint32_t light_instance_get_shadow_section_count(RID p_light_instance) const override;
 	virtual RID light_instance_get_shadow_section(RID p_light_instance, uint32_t p_section) const override;
 	virtual bool light_instance_has_shadow_slot(RID p_shadow_atlas, RID p_light_instance) override { return shadow_atlas_owns_light_instance(p_shadow_atlas, p_light_instance); }
+	bool light_instance_is_line_shadow_simplified(RID p_light_instance) const;
 
 	virtual bool light_instance_is_shadow_visible_at_position(RID p_light_instance, const Vector3 &p_position) const override {
 		const LightInstance *light_instance = light_instance_owner.get_or_null(p_light_instance);
@@ -891,10 +895,12 @@ public:
 	RID get_spot_light_buffer() { return spot_light_buffer; }
 	RID get_area_light_buffer() { return area_light_buffer; }
 	RID get_line_light_buffer() { return line_light_buffer; }
-	// Indices into the line light buffer, and whether each has contact shadows.
-	const uint32_t *get_line_screen_shadows(uint32_t &r_count, const bool *&r_contact) const {
+	// Indices into the line light buffer, whether each has contact shadows, and whether
+	// each needs the screen-space walk at all.
+	const uint32_t *get_line_screen_shadows(uint32_t &r_count, const bool *&r_contact, const bool *&r_walk) const {
 		r_count = line_screen_shadow_count;
 		r_contact = line_screen_shadow_contact;
+		r_walk = line_screen_shadow_walk;
 		return line_screen_shadows;
 	}
 	bool line_screen_shadows_overflowed() const { return line_screen_shadows_overflow; }

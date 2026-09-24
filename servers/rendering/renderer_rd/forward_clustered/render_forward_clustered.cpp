@@ -1767,15 +1767,18 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 	// After update_light_buffers(), which picks the lights and fills their buffer.
 	{
 		RendererRD::SSEffects::LineShadowParams params;
-		params.lights = light_storage->get_line_screen_shadows(params.light_count, params.contact);
-		bool ready = rb_data.is_valid() && ss_effects && params.light_count > 0 && p_normal_roughness_slices[0].is_valid() && light_storage->shadow_atlas_get_line_pyramid(p_render_data->shadow_atlas).is_valid();
+		params.lights = light_storage->get_line_screen_shadows(params.light_count, params.contact, params.walk);
+		// Contact shadows need no line pyramid, which simplified lights never build.
+		bool ready = rb_data.is_valid() && ss_effects && params.light_count > 0 && p_normal_roughness_slices[0].is_valid();
 		bool any_contact = false;
+		bool any_walk = false;
 		bool contact[RendererRD::LightStorage::LINE_SCREEN_SHADOWS_MAX];
 		for (uint32_t i = 0; i < params.light_count; i++) {
 			contact[i] = p_use_sscs && params.contact[i];
 			any_contact = any_contact || contact[i];
+			any_walk = any_walk || params.walk[i];
 		}
-		line_shadow_pass_used = line_shadow_pass_used && ready;
+		line_shadow_pass_used = line_shadow_pass_used && ready && (!any_walk || light_storage->shadow_atlas_get_line_pyramid(p_render_data->shadow_atlas).is_valid());
 		line_sscs_used = line_sscs_used && ready && any_contact;
 		for (uint32_t i = 0; i < params.light_count; i++) {
 			contact[i] = contact[i] && line_sscs_used;
@@ -1805,6 +1808,7 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 				params.scene_data = line_shadow_scene_data;
 				params.shadow_atlas = light_storage->shadow_atlas_get_texture(p_render_data->shadow_atlas);
 				params.line_pyramid = light_storage->shadow_atlas_get_line_pyramid(p_render_data->shadow_atlas);
+				params.shadow_sampler = shadow_sampler;
 				params.ltc_lut1 = rd_texture_storage->texture_get_rd_texture(ltc.lut1_texture);
 				params.ltc_lut2 = rd_texture_storage->texture_get_rd_texture(ltc.lut2_texture);
 				params.filter_passes = GLOBAL_GET_CACHED(int, "rendering/lights_and_shadows/positional_shadow/line_light_shadow_filter");
@@ -2833,6 +2837,9 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 	Projection light_projection;
 	Transform3D light_transform;
 
+	const bool is_line = light_storage->light_get_type(base) == RSE::LIGHT_LINE;
+	const bool line_simplified = is_line && light_storage->light_instance_is_line_shadow_simplified(p_light);
+
 	if (light_storage->light_get_type(base) == RSE::LIGHT_DIRECTIONAL) {
 		//set pssm stuff
 		uint64_t last_scene_shadow_pass = light_storage->light_instance_get_shadow_pass(p_light);
@@ -2911,7 +2918,7 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 
 		zfar = light_storage->light_get_param(base, RSE::LIGHT_PARAM_RANGE);
 
-		if (light_storage->light_get_type(base) == RSE::LIGHT_OMNI || light_storage->light_get_type(base) == RSE::LIGHT_LINE) {
+		if (light_storage->light_get_type(base) == RSE::LIGHT_OMNI || is_line) {
 			bool wrap = (shadow + 1) % subdivision == 0;
 			dual_paraboloid_offset = wrap ? Vector2i(1 - subdivision, 1) : Vector2i(1, 0);
 
@@ -2919,7 +2926,6 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 			// the cull pass, which worked it out placing this viewpoint's camera: the
 			// two must agree exactly or every depth comparison in the shader is scaled
 			// wrong.
-			const bool is_line = light_storage->light_get_type(base) == RSE::LIGHT_LINE;
 			if (is_line) {
 				zfar = light_storage->light_instance_get_shadow_range(p_light, 0);
 			}
@@ -2993,19 +2999,25 @@ void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas
 			Rect2 atlas_rect_norm = atlas_rect;
 			atlas_rect_norm.position /= float(atlas_size);
 			atlas_rect_norm.size /= float(atlas_size);
-			const bool polar = light_storage->light_get_type(base) == RSE::LIGHT_LINE;
-			copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, false, polar);
-			atlas_rect_norm.position += Vector2(dual_paraboloid_offset) * atlas_rect_norm.size;
-			copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, true, polar);
-			if (polar) {
-				int level_count = 0;
-				const RID *levels = light_storage->shadow_atlas_get_line_pyramid_levels(p_shadow_atlas, level_count);
-				if (levels) {
-					RID atlas_texture = light_storage->shadow_atlas_get_texture(p_shadow_atlas);
-					// Only levels no coarser than the slot are ever read.
-					level_count = MIN(level_count, (int)Math::floor_log2((uint32_t)atlas_rect.size.width) - 1);
-					copy_effects->build_line_shadow_pyramid(atlas_texture, levels, level_count, atlas_rect);
-					copy_effects->build_line_shadow_pyramid(atlas_texture, levels, level_count, Rect2i(atlas_rect.position + dual_paraboloid_offset * atlas_rect.size, atlas_rect.size));
+			if (line_simplified) {
+				// The casters' hemisphere only; `cube_to_dp` stores z > 0 when flipped.
+				const bool flip = light_storage->light_get_param(base, RSE::LIGHT_PARAM_LINE_SHADOW_HEMISPHERE_ANGLE) > 0.0;
+				copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, flip, false);
+			} else {
+				const bool polar = light_storage->light_get_type(base) == RSE::LIGHT_LINE;
+				copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, false, polar);
+				atlas_rect_norm.position += Vector2(dual_paraboloid_offset) * atlas_rect_norm.size;
+				copy_effects->copy_cubemap_to_dp(render_texture, atlas_fb, atlas_rect_norm, atlas_rect.size, light_projection.get_z_near(), zfar, true, polar);
+				if (polar) {
+					int level_count = 0;
+					const RID *levels = light_storage->shadow_atlas_get_line_pyramid_levels(p_shadow_atlas, level_count);
+					if (levels) {
+						RID atlas_texture = light_storage->shadow_atlas_get_texture(p_shadow_atlas);
+						// Only levels no coarser than the slot are ever read.
+						level_count = MIN(level_count, (int)Math::floor_log2((uint32_t)atlas_rect.size.width) - 1);
+						copy_effects->build_line_shadow_pyramid(atlas_texture, levels, level_count, atlas_rect);
+						copy_effects->build_line_shadow_pyramid(atlas_texture, levels, level_count, Rect2i(atlas_rect.position + dual_paraboloid_offset * atlas_rect.size, atlas_rect.size));
+					}
 				}
 			}
 

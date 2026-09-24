@@ -434,7 +434,9 @@ void main() {
 	}
 	vec4 center = texelFetch(source_buffer, pixel, 0);
 	float depth = texelFetch(depth_buffer, pixel, 0).r;
-	float radius = line_lights.data[params.light_index].size;
+	// MODE_SIMPLE stores the spread in metres, so the radius is 1.
+	bool simplified = line_lights.data[params.light_index].area_height.x != 0.0;
+	float radius = simplified ? 1.0 : line_lights.data[params.light_index].size;
 	if (depth <= 0.0 || radius <= 0.0) {
 		imageStore(output_visibility, pixel, center);
 		return;
@@ -443,6 +445,18 @@ void main() {
 	vec3 normal = scene_normal(pixel);
 	vec3 tangent = normalize(cross(normal, abs(normal.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
 	vec3 bitangent = cross(normal, tangent);
+	float across = 1.0;
+	if (simplified) {
+		// The segment's penumbra runs where the plane through it and this point meets the
+		// surface; across that, only the tube's radius spreads it.
+		vec3 segment = line_lights.data[params.light_index].area_width;
+		vec3 along = cross(cross(segment, vertex - line_lights.data[params.light_index].position), normal);
+		if (dot(along, along) > 1e-8) {
+			tangent = normalize(along);
+			bitangent = cross(normal, tangent);
+			across = clamp(2.0 * line_lights.data[params.light_index].size / length(segment), 0.1, 1.0);
+		}
+	}
 	// Rotated per pixel and frame; temporal antialiasing averages the pattern.
 	const vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
 	float angle = 6.2831853 * fract(magic.z * fract(dot(vec2(pixel) + params.taa_frame_count * 5.588238, magic.xy)));
@@ -461,7 +475,7 @@ void main() {
 		float t = sqrt((float(i) + 0.5) / float(PENUMBRA_SEARCH_TAPS));
 		float a = angle + float(i) * 2.3999632;
 		ivec2 q;
-		if (_penumbra_tap(vertex, normal, search * t * (cos(a) * tangent + sin(a) * bitangent), q)) {
+		if (_penumbra_tap(vertex, normal, search * t * (cos(a) * tangent + across * sin(a) * bitangent), q)) {
 			vec2 blocker = texelFetch(source_buffer, q, 0).ba;
 			if (blocker.y > 0.01) {
 				float f = blocker.x / blocker.y;
@@ -489,7 +503,7 @@ void main() {
 		float t = sqrt((float(i) + 0.5) / float(PENUMBRA_FILTER_TAPS));
 		float a = angle + float(i) * 2.3999632;
 		ivec2 q;
-		if (_penumbra_tap(vertex, normal, spread * t * (cos(a) * tangent + sin(a) * bitangent), q)) {
+		if (_penumbra_tap(vertex, normal, spread * t * (cos(a) * tangent + across * sin(a) * bitangent), q)) {
 			sum += texelFetch(source_buffer, q, 0).rg;
 			sum_w += 1.0;
 		}
@@ -518,8 +532,34 @@ layout(set = 0, binding = 19, std430) restrict readonly buffer WalkList {
 }
 walk_list;
 
+#ifdef MODE_SIMPLE
+layout(set = 0, binding = 21) uniform sampler shadow_sampler;
+#else
 #define LINE_SHADOW_BLOCKER
+#endif
 #include "../line_light_shadow_inc.glsl"
+
+#ifdef MODE_SIMPLE
+
+// Few taps: the penumbra filter and TAA denoise.
+#define SIMPLE_TAPS 8u
+
+void main() {
+	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(pixel, params.screen_size))) {
+		return;
+	}
+	float depth = texelFetch(depth_buffer, pixel, 0).r;
+	vec4 visibility = vec4(1.0, 1.0, 0.0, 0.0);
+	if (depth > 0.0) {
+		float blur;
+		float vis = line_shadow_simplified(params.light_index, view_position(pixel, depth), scene_normal(pixel), params.taa_frame_count, vec2(pixel) + 0.5, SIMPLE_TAPS, scene_data_block.data.shadow_atlas_pixel_size, blur);
+		visibility = vec4(vis, vis, blur > 0.0 ? vec2(1.0 / (1.0 + blur), 1.0) : vec2(0.0));
+	}
+	imageStore(output_visibility, pixel, visibility);
+}
+
+#else
 
 void main() {
 	uint id = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u;
@@ -612,5 +652,7 @@ void main() {
 	}
 	imageStore(output_visibility, pixel, visibility);
 }
+
+#endif // MODE_SIMPLE
 
 #endif

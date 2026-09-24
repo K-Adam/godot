@@ -37,5 +37,11 @@
 		<member name="line_range" type="float" setter="set_param" getter="get_param" default="5.0">
 			The range of the line light in meters. This determines the maximum distance from any point on the segment at which the light can still be seen.
 		</member>
+		<member name="line_shadow_hemisphere_angle" type="float" setter="set_param" getter="get_param" default="0.0">
+			Shadows the light with one ordinary hemisphere shadow map, seen from the middle of the segment, instead of its exact shadows: far cheaper, less accurate. The default [code]0.0[/code] keeps the exact shadows.
+			The sign picks which end of the segment the map faces: the [code]+X[/code] end when positive, the [code]-X[/code] end when negative. A tube hung above a scene with nothing above it wants [code]90.0[/code] when its local [code]+X[/code] axis points down. The magnitude is the cone, apex at that end, within which every caster lies; narrowing it lets whole faces of the map go undrawn. The gizmo draws the cone while the light is selected.
+			Shadows soften with the blocker's distance from the receiver, over the segment's length. [member Light3D.shadow_bias] and [member Light3D.shadow_normal_bias] apply as in the exact mode; blockers closer to a surface than the bias are left to contact shadows, whose rays reach further in this mode ([member ProjectSettings.rendering/lights_and_shadows/contact_shadow/enabled]).
+			[b]Note:[/b] A caster outside the cone casts no real-time shadow from this light, in volumetric fog as well as on surfaces.
+		</member>
 	</members>
 </class>

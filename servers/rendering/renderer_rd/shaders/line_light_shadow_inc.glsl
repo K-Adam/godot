@@ -70,6 +70,147 @@ uvec4 line_shadow_contact_cells(uint hits, float jitter) {
 	return cells;
 }
 
+// One hemisphere map from the segment's middle, in place of the polar walk.
+#ifndef LINE_SHADOW_BLOCKER
+#define LINE_SIMPLE_SEARCH 6u
+#define LINE_SIMPLE_PLANE_TEXELS 1.5
+
+// The point where the ray from `light_point` to the receiver at `rel` is `dist` from the
+// map's origin, or the receiver if it never gets that close.
+vec3 _line_simple_through(vec3 light_point, vec3 rel, float dist) {
+	vec3 ray = rel - light_point;
+	float a = max(dot(ray, ray), 1e-9);
+	float b = dot(light_point, ray);
+	float disc = b * b - a * (dot(light_point, light_point) - dist * dist);
+	float t = disc > 0.0 ? (sqrt(disc) - b) / a : 1.0;
+	t = t > 0.0 ? min(t, 1.0) : 1.0;
+	return light_point + ray * t;
+}
+
+uint _line_simple_hash(uint x) {
+	x = ((x >> 16u) ^ x) * 0x45d9f3bu;
+	x = ((x >> 16u) ^ x) * 0x45d9f3bu;
+	return (x >> 16u) ^ x;
+}
+
+float _line_simple_plane(float plane_num, float nd, float d_r, float texel_angle, float lift) {
+	float slack = min(LINE_SIMPLE_PLANE_TEXELS * d_r * texel_angle * sqrt(max(1.0 - nd * nd, 0.0)) / -nd, 0.25 * d_r);
+	return plane_num / nd - slack - lift;
+}
+
+// PCSS with the segment as the light. Taps follow their own ray from the segment, not the
+// parallel direction from the map, and compare against the receiver's plane.
+// `blur` is how far the result can be smoothed on the receiver without losing the shadow's
+// shape: a fraction of its penumbra.
+float line_shadow_simplified(uint idx, vec3 vertex, vec3 normal, float taa_frame_count, vec2 pixel, uint samples, vec2 atlas_texel_size, out float blur) {
+	blur = 0.0;
+	vec4 rect = line_lights.data[idx].atlas_rect;
+	if (rect.z <= 0.0) {
+		return 1.0;
+	}
+	float side = line_lights.data[idx].area_height.x;
+	float half_len = 0.5 * length(line_lights.data[idx].area_width);
+	float inv_far = line_lights.data[idx].cone_attenuation;
+	float far = 1.0 / max(inv_far, 1e-9);
+	vec4 uv_rect = vec4(rect.xy + atlas_texel_size, rect.zw - atlas_texel_size * 2.0);
+	float texel_angle = M_PI * atlas_texel_size.x / max(rect.z, 1e-6);
+
+	mat3 to_local = mat3(line_lights.data[idx].shadow_matrix);
+	vec3 rel = (line_lights.data[idx].shadow_matrix * vec4(vertex, 1.0)).xyz;
+	float d_r = length(rel);
+	if (d_r < 1e-4) {
+		return 1.0;
+	}
+	vec3 n = to_local * normal;
+	n = dot(n, n) > 1e-12 ? normalize(n) : -rel / d_r;
+	float plane_num = dot(rel, n);
+	// As in the exact walk, blockers this close to the receiver are left to contact shadows.
+	float d_seg = length(vec2(length(rel.xy), max(abs(rel.z) - half_len, 0.0)));
+	float lift = line_lights.data[idx].shadow_bias + line_lights.data[idx].shadow_normal_bias * d_seg;
+
+	// White noise per pixel and frame: interleaved gradient noise lays out diagonal lines,
+	// which show whenever TAA drops its history.
+	uint seed = _line_simple_hash(uint(pixel.x) + 8192u * uint(pixel.y) + 67108864u * uint(taa_frame_count));
+	float strat = float(seed >> 8u) / 16777216.0;
+	float around = float(_line_simple_hash(seed) >> 8u) / 16777216.0;
+
+	vec3 t1 = cross(vec3(0.0, 0.0, 1.0), rel);
+	t1 = dot(t1, t1) > 1e-12 ? normalize(t1) : vec3(1.0, 0.0, 0.0);
+	vec3 t2 = cross(rel / d_r, t1);
+	vec3 across = t1 * max(line_lights.data[idx].size, 0.0);
+
+	float d_min = far;
+	float d_max = 0.0;
+	for (uint i = 0u; i < LINE_SIMPLE_SEARCH; i++) {
+		float u = i == 0u ? 0.5 : (float(i) + strat) / float(LINE_SIMPLE_SEARCH);
+		vec3 light_point = vec3(0.0, 0.0, mix(-half_len, half_len, u));
+		vec3 dir = normalize(rel + (light_point - rel) * (0.75 * fract(float(i) * 0.618034 + around)));
+		// Off the plane through the segment and the receiver too, or pixels sharing a column of
+		// texels across it would all find the same blockers.
+		float a = float(i) * 2.399963 + around * 2.0 * M_PI;
+		dir = normalize(dir + (t1 * cos(a) + t2 * sin(a)) * (sqrt((float(i) + 0.5) / float(LINE_SIMPLE_SEARCH)) * 3.0 * texel_angle));
+		float nd = dot(dir, n);
+		float dp_z = dir.z * side;
+		if (nd > -1e-3 || dp_z < 0.0) {
+			continue;
+		}
+		vec2 uv = uv_rect.xy + (dir.xy / (1.0 + dp_z) * 0.5 + 0.5) * uv_rect.zw;
+		float stored = textureLod(sampler2D(shadow_atlas, SAMPLER_NEAREST_CLAMP), uv, 0.0).r;
+		float d = (1.0 - stored) * far;
+		if (stored > 0.0 && d < _line_simple_plane(plane_num, nd, d_r, texel_angle, lift)) {
+			d_min = min(d_min, d);
+			d_max = max(d_max, d);
+		}
+	}
+	if (d_max <= 0.0) {
+		return 1.0;
+	}
+
+	// Tested at the nearest, furthest and a middle blocker depth and averaged: the map's rays
+	// are not the segment's, so needing all three lit over-darkens lattices. How far apart
+	// the crossings are is the penumbra, so the kernel needs no size of its own.
+	float d_b = 0.5 * (d_min + d_max);
+	blur = max(0.4 * half_len * max(d_r - d_b, 0.0) / max(d_b, 1e-4), 1e-3);
+	vec3 end_a = _line_simple_through(vec3(0.0, 0.0, -half_len), rel, d_b);
+	vec3 end_b = _line_simple_through(vec3(0.0, 0.0, half_len), rel, d_b);
+	float spread = acos(clamp(dot(normalize(end_a), normalize(end_b)), -1.0, 1.0));
+	uint taps = max(samples / 2u, 4u);
+	// Filter along `t2` only: across the plane of segment and receiver the shadow is sharp, and
+	// wider taps miss thin blockers. At least 1.5 texels, which hides texel stairs.
+	float footprint = max(1.5 * texel_angle, spread / float(taps));
+
+	float rotation = around * 2.0 * M_PI;
+	float lit = 0.0;
+	for (uint i = 0u; i < taps; i++) {
+		float u = (float(i) + strat) / float(taps);
+		vec3 light_point = vec3(0.0, 0.0, mix(-half_len, half_len, u)) + across * (2.0 * fract(float(i) * 0.618034 + around) - 1.0);
+		float r = sqrt((float(i) + 0.5) / float(taps));
+		float a = float(i) * 2.399963 + rotation;
+		vec3 offset = (t1 * (cos(a) * 1.5 * texel_angle) + t2 * (sin(a) * footprint)) * r;
+		float tap = 0.0;
+		float inside = mix(d_min, d_max, fract(float(i) * 0.7548777 + strat));
+		for (uint k = 0u; k < 3u; k++) {
+			float depth_at = k == 0u ? d_min : (k == 1u ? d_max : inside);
+			vec3 dir = normalize(normalize(_line_simple_through(light_point, rel, depth_at)) + offset);
+			float dp_z = dir.z * side;
+			float nd = dot(dir, n);
+			// Out of the casters' hemisphere, or above the receiver's horizon: nothing to test.
+			if (dp_z < 0.0 || nd > -1e-3) {
+				tap += 1.0;
+				continue;
+			}
+			// Kept inside the range so that empty texels still compare as lit.
+			float depth = clamp(_line_simple_plane(plane_num, nd, d_r, texel_angle, lift), 0.0, 0.999 * far);
+			vec2 uv = uv_rect.xy + (dir.xy / (1.0 + dp_z) * 0.5 + 0.5) * uv_rect.zw;
+			tap += textureProj(sampler2DShadow(shadow_atlas, shadow_sampler), vec4(uv, 1.0 - depth * inv_far, 1.0));
+		}
+		lit += tap / 3.0;
+	}
+
+	return mix(1.0, lit / float(taps), line_lights.data[idx].shadow_opacity);
+}
+#endif // !LINE_SHADOW_BLOCKER
+
 #ifdef LINE_SHADOW_BLOCKER
 // Sum of (blocker's distance from the line / receiver's) over newly hidden diffuse cells,
 // and their count: how far the penumbra spreads (screen-space pass only).

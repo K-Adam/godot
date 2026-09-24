@@ -91,6 +91,7 @@ void LightStorage::_light_initialize(RID p_light, RSE::LightType p_type) {
 	light.param[RSE::LIGHT_PARAM_INTENSITY] = p_type == RSE::LIGHT_DIRECTIONAL ? 100000.0 : 1000.0;
 	light.param[RSE::LIGHT_PARAM_CONTACT_SHADOW_OPACITY] = 1.0;
 	light.param[RSE::LIGHT_PARAM_CONTACT_SHADOW_BLUR] = 1.0;
+	light.param[RSE::LIGHT_PARAM_LINE_SHADOW_HEMISPHERE_ANGLE] = 0.0;
 
 	light_owner.initialize_rid(p_light, light);
 }
