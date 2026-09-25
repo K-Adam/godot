@@ -1768,6 +1768,7 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 	{
 		RendererRD::SSEffects::LineShadowParams params;
 		params.lights = light_storage->get_line_screen_shadows(params.light_count, params.contact, params.walk);
+		params.contact_blur = light_storage->get_line_screen_shadow_contact_blur();
 		// Contact shadows need no line pyramid, which simplified lights never build.
 		bool ready = rb_data.is_valid() && ss_effects && params.light_count > 0 && p_normal_roughness_slices[0].is_valid();
 		bool any_contact = false;

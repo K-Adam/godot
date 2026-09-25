@@ -206,6 +206,7 @@ private:
 	uint32_t line_light_count = 0;
 	uint32_t line_screen_shadows[LINE_SCREEN_SHADOWS_MAX];
 	bool line_screen_shadow_contact[LINE_SCREEN_SHADOWS_MAX];
+	float line_screen_shadow_contact_blur[LINE_SCREEN_SHADOWS_MAX];
 	// False for simplified lights, which the pass samples without the walk.
 	bool line_screen_shadow_walk[LINE_SCREEN_SHADOWS_MAX];
 	// Per screen-space shadow: what its shadow looks from (instance, transform, params,
@@ -903,6 +904,8 @@ public:
 		r_walk = line_screen_shadow_walk;
 		return line_screen_shadows;
 	}
+	// Per screen-space shadow: how far its contact shadow softens with distance from the contact.
+	const float *get_line_screen_shadow_contact_blur() const { return line_screen_shadow_contact_blur; }
 	bool line_screen_shadows_overflowed() const { return line_screen_shadows_overflow; }
 	const LineScreenShadowState *get_line_screen_shadow_states() const {
 		return line_screen_shadow_state;

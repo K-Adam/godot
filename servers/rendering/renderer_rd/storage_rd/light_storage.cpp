@@ -1454,6 +1454,7 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
 							state.version = MAX(state.version, atlas->quadrants[(*slot >> QUADRANT_SHIFT) & 0x3].shadows[*slot & SHADOW_INDEX_MASK].version);
 						}
 						line_screen_shadow_contact[line_screen_shadow_count] = light->allow_contact_shadows;
+						line_screen_shadow_contact_blur[line_screen_shadow_count] = light->param[RSE::LIGHT_PARAM_CONTACT_SHADOW_BLUR];
 						line_screen_shadow_walk[line_screen_shadow_count] = !simplified;
 						line_screen_shadows[line_screen_shadow_count++] = index;
 						light_data.cos_spot_angle = light->allow_contact_shadows ? float(line_screen_shadow_count) : -float(line_screen_shadow_count);

@@ -203,6 +203,7 @@ public:
 	struct LineShadowParams {
 		const uint32_t *lights = nullptr; // Line light buffer indices; one layer each per view.
 		const bool *contact = nullptr; // Per light: whether to march contact shadows.
+		const float *contact_blur = nullptr; // Per light: filter radius per pixel of hit distance; 0 keeps a 3x3 tent.
 		const bool *walk = nullptr; // Per light: whether it needs the shadow map walk at all.
 		bool keep_raw_contact = false; // Keep each light's unfiltered hits for line_light_shadows().
 		uint32_t light_count = 0;

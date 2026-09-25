@@ -5,8 +5,10 @@
 #VERSION_DEFINES
 
 // Line light contact shadows: each pixel marches a short ray towards each quarter of
-// its cells and stores the hits as bits; MODE_FILTER averages them over neighbours on
-// the same surface. The forward pass adds them to the line light's shadow mask.
+// its cells and stores the hits as bits, and how far along the nearest hit was; MODE_FILTER
+// averages them over neighbours on the same surface, over a radius that grows with that
+// distance, so a contact stays sharp and the shadow softens away from it. The forward pass
+// adds them to the line light's shadow mask.
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -42,6 +44,9 @@ params;
 #define STRATA 4u
 // Rays reach this many shadow map texels: the shadow map resolves anything further.
 #define REACH_TEXELS 4.0
+// The raw hits keep the nearest hit's distance in their upper four bits, as
+// log2(1 + pixels) * HIT_SCALE: 15 is some 380 pixels, the longest a simplified light marches.
+#define HIT_SCALE 1.75
 
 // https://www.iryoku.com/next-generation-post-processing-in-call-of-duty-advanced-warfare
 float interleaved_gradient_noise(vec2 pos) {
@@ -77,16 +82,89 @@ float depth_slope(ivec2 pixel, float z, mat4 inv_projection) {
 
 #ifdef MODE_FILTER
 
+// Here params.thickness carries the light's contact blur, the filter radius per pixel of hit
+// distance, and params.max_pixels the widest radius it may reach.
+#define TAPS 12
+
+uint raw_hits(ivec2 pixel) {
+	return uint(texelFetch(hits_buffer, clamp(pixel, ivec2(0), params.screen_size - 1), 0).r * 255.0 + 0.5);
+}
+
+vec4 quarters(uint raw) {
+	return vec4(notEqual(uvec4(raw) & uvec4(1u, 2u, 4u, 8u), uvec4(0u)));
+}
+
+void store(ivec2 pixel, vec4 fraction) {
+	uvec4 f = uvec4(round(fraction * 15.0));
+	uint fractions = f.x | (f.y << 4u) | (f.z << 8u) | (f.w << 12u);
+	imageStore(output_hits, pixel, vec4((float(fractions) + 0.25) / 65535.0));
+}
+
+// Golden angle spiral over the unit disk, turned by `spin`.
+vec2 tap(int i, float spin) {
+	float a = float(i) * 2.39996323 + spin;
+	return sqrt((float(i) + 0.5) / float(TAPS)) * vec2(cos(a), sin(a));
+}
+
+void soften(ivec2 pixel) {
+	uint centre = raw_hits(pixel);
+	float spin = 6.2831853 * interleaved_gradient_noise(vec2(pixel) + params.taa_frame_count * 5.588238);
+	// Blocker search over the widest radius, so a lit pixel beside a hit is softened too and
+	// the edge spreads both ways rather than only into the shadow.
+	float found = 0.0;
+	float hit_distance = 0.0;
+	if ((centre & 15u) != 0u) {
+		found = 1.0;
+		hit_distance = exp2(float(centre >> 4u) / HIT_SCALE) - 1.0;
+	}
+	for (int i = 0; i < TAPS; i++) {
+		uint raw = raw_hits(pixel + ivec2(round(tap(i, spin) * params.max_pixels)));
+		if ((raw & 15u) != 0u) {
+			found += 1.0;
+			hit_distance += exp2(float(raw >> 4u) / HIT_SCALE) - 1.0;
+		}
+	}
+	float depth = texelFetch(depth_buffer, pixel, 0).r;
+	if (found == 0.0 || depth == 0.0) {
+		imageStore(output_hits, pixel, vec4(0.0));
+		return;
+	}
+	float radius = clamp(hit_distance / found * params.thickness, 1.0, params.max_pixels);
+
+	mat4 inv_projection = inverse(params.projection);
+	vec2 screen = vec2(params.screen_size);
+	vec3 p = view_position((vec2(pixel) + 0.5) / screen, depth, inv_projection);
+	vec3 normal = scene_normal(pixel);
+	vec4 sum = 2.0 * quarters(centre);
+	float total = 2.0;
+	for (int i = 0; i < TAPS; i++) {
+		ivec2 q = clamp(pixel + ivec2(round(tap(i, spin) * radius)), ivec2(0), params.screen_size - 1);
+		vec3 d = view_position((vec2(q) + 0.5) / screen, texelFetch(depth_buffer, q, 0).r, inv_projection) - p;
+		// Off the centre's plane rather than a depth difference, which on a grazing floor grows
+		// with the tap's distance until nothing counts as the same surface. That test is what
+		// keeps a shadow from leaking onto whatever stands behind or in front.
+		if (abs(dot(d, normal)) > 0.004 * -p.z + 0.01 * length(d) || dot(scene_normal(q), normal) < 0.9) {
+			continue;
+		}
+		sum += quarters(raw_hits(q));
+		total += 1.0;
+	}
+	store(pixel, sum / total);
+}
+
 void main() {
 	ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 	if (any(greaterThanEqual(pixel, params.screen_size))) {
 		return;
 	}
+	if (params.thickness > 0.0) {
+		soften(pixel);
+		return;
+	}
 	uint bits[9];
 	uint any_bits = 0u;
 	for (int i = 0; i < 9; i++) {
-		ivec2 q = clamp(pixel + ivec2(i % 3 - 1, i / 3 - 1), ivec2(0), params.screen_size - 1);
-		bits[i] = uint(texelFetch(hits_buffer, q, 0).r * 255.0 + 0.5);
+		bits[i] = raw_hits(pixel + ivec2(i % 3 - 1, i / 3 - 1)) & 15u;
 		any_bits |= bits[i];
 	}
 	if (any_bits == 0u) {
@@ -109,12 +187,10 @@ void main() {
 			continue;
 		}
 		float w = float((2 - abs(o.x)) * (2 - abs(o.y)));
-		sum += w * vec4(notEqual(uvec4(bits[i]) & uvec4(1u, 2u, 4u, 8u), uvec4(0u)));
+		sum += w * quarters(bits[i]);
 		total += w;
 	}
-	uvec4 f = uvec4(round(sum / max(total, 1.0) * 15.0));
-	uint fractions = f.x | (f.y << 4u) | (f.z << 8u) | (f.w << 12u);
-	imageStore(output_hits, pixel, vec4((float(fractions) + 0.25) / 65535.0));
+	store(pixel, sum / max(total, 1.0));
 }
 
 #else
@@ -126,6 +202,7 @@ void main() {
 	}
 
 	uint hits = 0u;
+	float nearest = 1e9;
 	float depth = texelFetch(depth_buffer, pixel, 0).r;
 	mat4 inv_projection = inverse(params.projection);
 	vec2 screen = vec2(params.screen_size);
@@ -202,14 +279,16 @@ void main() {
 				float in_front = z - p.z;
 				if (in_front > tolerance && in_front < params.thickness * -p.z) {
 					hits |= 1u << k;
+					nearest = min(nearest, t * pixels_per_unit);
 					break;
 				}
 			}
 		}
 	}
 
-	// Offset so that either rounding a driver may use stores `hits`.
-	imageStore(output_hits, pixel, vec4((float(hits) + 0.25) / 255.0));
+	uint hit_distance = hits != 0u ? uint(clamp(round(log2(1.0 + nearest) * HIT_SCALE), 0.0, 15.0)) : 0u;
+	// Offset so that either rounding a driver may use stores the bits.
+	imageStore(output_hits, pixel, vec4((float(hits | (hit_distance << 4u)) + 0.25) / 255.0));
 }
 
 #endif

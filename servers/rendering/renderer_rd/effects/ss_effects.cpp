@@ -1974,6 +1974,9 @@ static void _line_shadow_texture_create(Ref<RenderSceneBuffersRD> p_render_buffe
 	p_render_buffers->create_texture_from_format(p_scope, p_name, tf);
 }
 
+// The widest a contact shadow's filter reaches, as a fraction of the screen's height.
+static constexpr float LINE_CONTACT_BLUR_MAX = 0.025f;
+
 void SSEffects::line_light_contact_shadows(Ref<RenderSceneBuffersRD> p_render_buffers, const LineShadowParams &p_params) {
 	const uint32_t view_count = p_render_buffers->get_view_count();
 	const Size2i size = p_render_buffers->get_internal_size();
@@ -1992,6 +1995,9 @@ void SSEffects::line_light_contact_shadows(Ref<RenderSceneBuffersRD> p_render_bu
 	LineLightContactShadowsPushConstant push_constant = {};
 	push_constant.screen_size[0] = size.width;
 	push_constant.screen_size[1] = size.height;
+	push_constant.taa_frame_count = p_params.taa_frame_count;
+	// The filter marches nothing, so it carries its blur and widest radius in these two.
+	push_constant.max_pixels = MAX(1.0f, LINE_CONTACT_BLUR_MAX * size.height);
 	RID filter_shader = sscs.line_shader.version_get_shader(sscs.line_shader_version, 1);
 	RD::Uniform u_lights(RD::UNIFORM_TYPE_STORAGE_BUFFER, 2, p_params.line_light_buffer);
 	for (uint32_t v = 0; v < view_count; v++) {
@@ -2005,6 +2011,8 @@ void SSEffects::line_light_contact_shadows(Ref<RenderSceneBuffersRD> p_render_bu
 			RID raw = p_render_buffers->get_texture_slice(RB_SCOPE_SSCS_LINE, RB_SSCS_RAW, p_params.keep_raw_contact ? i * view_count + v : v, 0);
 			RD::Uniform u_raw_input(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 4, Vector<RID>{ sscs.border_sampler, raw });
 			_line_light_contact_march(p_render_buffers, p_params, v, i, raw);
+			push_constant.light_index = p_params.lights[i];
+			push_constant.thickness = p_params.contact_blur ? p_params.contact_blur[i] : 0.0f;
 
 			RD::Uniform u_output(RD::UNIFORM_TYPE_IMAGE, 1, p_render_buffers->get_texture_slice(RB_SCOPE_SSCS_LINE, RB_SSCS, i * view_count + v, 0));
 			RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
