@@ -98,6 +98,11 @@ float _line_simple_plane(float plane_num, float nd, float d_r, float texel_angle
 	return plane_num / nd - slack - lift;
 }
 
+// Cosine of the ray from `light_point` to the receiver at `rel` with its normal: below -1e-3 is above its horizon.
+float _line_simple_facing(vec3 light_point, vec3 rel, vec3 n) {
+	return dot(normalize(rel - light_point), n);
+}
+
 // PCSS with the segment as the light. Taps follow their own ray from the segment, not the
 // parallel direction from the map, and compare against the receiver's plane.
 // `blur` is how far the result can be smoothed on the receiver without losing the shadow's
@@ -124,6 +129,11 @@ float line_shadow_simplified(uint idx, vec3 vertex, vec3 normal, float taa_frame
 	vec3 n = to_local * normal;
 	n = dot(n, n) > 1e-12 ? normalize(n) : -rel / d_r;
 	float plane_num = dot(rel, n);
+	// Wholly below the horizon, the receiver is unlit whatever this returns, but the denoise, the penumbra filter
+	// and the temporal reuse blend it into its neighbours, and returned lit it lit the strip along every terminator.
+	if (min(dot(rel - vec3(0.0, 0.0, -half_len), n), dot(rel - vec3(0.0, 0.0, half_len), n)) >= 0.0) {
+		return 0.0;
+	}
 	// As in the exact walk, blockers this close to the receiver are left to contact shadows.
 	float d_seg = length(vec2(length(rel.xy), max(abs(rel.z) - half_len, 0.0)));
 	float lift = line_lights.data[idx].shadow_bias + line_lights.data[idx].shadow_normal_bias * d_seg;
@@ -180,34 +190,41 @@ float line_shadow_simplified(uint idx, vec3 vertex, vec3 normal, float taa_frame
 	float footprint = max(1.5 * texel_angle, spread / float(taps));
 
 	float rotation = around * 2.0 * M_PI;
+	// Weighted by each tap's cosine, as the exact walk weights its cells. A tap from below the receiver's horizon
+	// weighs nothing: counted as lit, it lit the strip along every terminator, where part of the segment is below
+	// the horizon and the part above is hidden.
 	float lit = 0.0;
+	float weight = 0.0;
 	for (uint i = 0u; i < taps; i++) {
 		float u = (float(i) + strat) / float(taps);
 		vec3 light_point = vec3(0.0, 0.0, mix(-half_len, half_len, u)) + across * (2.0 * fract(float(i) * 0.618034 + around) - 1.0);
 		float r = sqrt((float(i) + 0.5) / float(taps));
 		float a = float(i) * 2.399963 + rotation;
 		vec3 offset = (t1 * (cos(a) * 1.5 * texel_angle) + t2 * (sin(a) * footprint)) * r;
-		float tap = 0.0;
+		float facing = _line_simple_facing(light_point, rel, n);
+		if (facing > -1e-3) {
+			continue;
+		}
 		float inside = mix(d_min, d_max, fract(float(i) * 0.7548777 + strat));
 		for (uint k = 0u; k < 3u; k++) {
 			float depth_at = k == 0u ? d_min : (k == 1u ? d_max : inside);
 			vec3 dir = normalize(normalize(_line_simple_through(light_point, rel, depth_at)) + offset);
 			float dp_z = dir.z * side;
 			float nd = dot(dir, n);
-			// Out of the casters' hemisphere, or above the receiver's horizon: nothing to test.
+			weight -= facing;
+			// Out of the casters' hemisphere, or a map direction that never meets the receiver's plane: nothing to test.
 			if (dp_z < 0.0 || nd > -1e-3) {
-				tap += 1.0;
+				lit -= facing;
 				continue;
 			}
 			// Kept inside the range so that empty texels still compare as lit.
 			float depth = clamp(_line_simple_plane(plane_num, nd, d_r, texel_angle, lift), 0.0, 0.999 * far);
 			vec2 uv = uv_rect.xy + (dir.xy / (1.0 + dp_z) * 0.5 + 0.5) * uv_rect.zw;
-			tap += textureProj(sampler2DShadow(shadow_atlas, shadow_sampler), vec4(uv, 1.0 - depth * inv_far, 1.0));
+			lit -= facing * textureProj(sampler2DShadow(shadow_atlas, shadow_sampler), vec4(uv, 1.0 - depth * inv_far, 1.0));
 		}
-		lit += tap / 3.0;
 	}
 
-	return mix(1.0, lit / float(taps), line_lights.data[idx].shadow_opacity);
+	return weight > 0.0 ? mix(1.0, lit / weight, line_lights.data[idx].shadow_opacity) : 0.0;
 }
 #endif // !LINE_SHADOW_BLOCKER
 
@@ -605,6 +622,13 @@ void line_shadow_visibility(uint idx, LineShadowContext ctx, vec3 normal, vec3 e
 	float lm = clamp(abs(a) < 0.999 ? a * dot(po_w, refl) / ((1.0 - a) * (1.0 + a)) : 0.0, l1, l2);
 	float w = max(2.0 * alpha * length(po_w + wt * lm), 1e-3);
 
+	// Wholly below the horizon: unlit whatever this says, and lit it would be blended into its neighbours by the
+	// filters and the temporal reuse, lighting the strip along every terminator and contact.
+	if (max(dot(normal, po_w + wt * l1), dot(normal, po_w + wt * l2)) <= 0.0) {
+		r_vis_diffuse = half(0.0);
+		r_vis_specular = do_diffuse || do_specular ? half(0.0) : r_vis_specular;
+		return;
+	}
 	// Cells are placed in the light's frame, u = l - l_center.
 	LineShadowCells cd = line_shadow_cells(-l_center, d, half_len, ctx.jitter);
 	LineShadowCells cs = line_shadow_cells(lm - l_center, w, half_len, fract(ctx.jitter + 0.5));
